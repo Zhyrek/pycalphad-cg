@@ -1,0 +1,4 @@
+include pycalphad_cg/_core.pyx
+exclude pycalphad_cg/_core.cpp
+recursive-include tests *.py
+recursive-include examples *.py

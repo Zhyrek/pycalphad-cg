@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=64", "Cython>=3.0", "scipy>=1.8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pycalphad-cg"
+dynamic = ["version"]
+description = "pycalphad with a column-generation equilibrium solver: a drop-in replacement for the pycalphad namespace"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{name = "Scott Peters"}]
+requires-python = ">=3.11"
+dependencies = ["pycalphad>=0.11.2", "numpy>=1.23", "scipy>=1.8"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Topic :: Scientific/Engineering :: Chemistry",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Cython",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.urls]
+Homepage = "https://github.com/Zhyrek/pycalphad-cg"
+Issues = "https://github.com/Zhyrek/pycalphad-cg/issues"
+
+[tool.setuptools]
+packages = ["pycalphad_cg", "pycalphad_cg.mapping", "pycalphad_cg.mapping.strategy"]
+
+[tool.setuptools.dynamic]
+version = {attr = "pycalphad_cg._version.__version__"}
+
+[tool.setuptools.exclude-package-data]
+pycalphad_cg = ["*.cpp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
