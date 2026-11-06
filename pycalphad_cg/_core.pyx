@@ -22,6 +22,7 @@ import numpy as np
 from libc.math cimport exp, log, fabs, sqrt, INFINITY, NAN, isfinite
 from libc.string cimport memcpy
 from libc.stdlib cimport malloc, free
+from libc.stdint cimport int64_t
 from scipy.linalg.cython_lapack cimport dsyev, dgetrf, dgetrs, dpotrf, dpotrs, dgesv, dgelss
 from pycalphad.core.constants import MIN_SITE_FRACTION
 
@@ -858,9 +859,9 @@ cdef class CPhase:
             for k in range(self.boff[b], self.boff[b + 1]): s += y[self.bidx[k]]
             for k in range(self.boff[b], self.boff[b + 1]): y[self.bidx[k]] /= s
 
-    cdef long pattern(self, double* y) noexcept nogil:
+    cdef int64_t pattern(self, double* y) noexcept nogil:
         """Ordering pattern: the dominant species on each sublattice."""
-        cdef long code = 0, mult = 1
+        cdef int64_t code = 0, mult = 1
         cdef int b, k, best
         cdef double m
         for b in range(self.nb):
@@ -938,7 +939,7 @@ cdef class Solver:
     cdef double[:, ::1] Py, Px, R
     cdef double[::1] PG, b, mf
     cdef int[::1] Pph, Pnext, head, basis, ipiv, fixed
-    cdef long[::1] Pcode
+    cdef int64_t[::1] Pcode   # (int64 on every platform: C long is 32 bits on Windows)
     cdef public double RT, bigM
     cdef double[::1] mu, dual, xB, LU, tmp, cB, ybuf, xbuf, ybest, xbest, ystart, colbuf, ycert
     cdef public long lp_iters, priced, skipped, npolish, npolish_try, nunpolished
@@ -1483,7 +1484,7 @@ cdef class Solver:
             best_tpd[0] = tpd
             memcpy(&self.ybest[0], &self.ybuf[0], (<CPhase>self.pptr[ph]).D * sizeof(double))
 
-    cdef void _price_from_points(self, int ph, int k, int rounds, int ncodes, long* codes, int* code_pt,
+    cdef void _price_from_points(self, int ph, int k, int rounds, int ncodes, int64_t* codes, int* code_pt,
                                  double* code_tpd, double* mu, double* best_tpd, int* all_conv) noexcept nogil:
         """Starts from stored points: the best one (k), the phase's points in the LP solution, the best of the other
         ordering patterns, and in the first round a disordered start at k's composition."""
@@ -1513,7 +1514,7 @@ cdef class Solver:
         cdef double best_tpd, maxdmu, t
         cdef void* pp
         cdef bint added = False
-        cdef long codes[64]
+        cdef int64_t codes[64]
         cdef int code_pt[64]
         cdef double code_tpd[64]
         cdef double* mu = &self.mu[0]

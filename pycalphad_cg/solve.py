@@ -463,6 +463,26 @@ def _consolidate(result):
     return [phs[k] for k in keep], [Y[k] for k in keep], [X[k] for k in keep], [n[k] for k in keep], [G[k] for k in keep]
 
 
+# A point whose contribution to every component's amount is below this fraction of that component's total is left out
+# of the result: a column the linear program kept at a degenerate vertex (e.g. a second phase at zero amount where the
+# composition is exactly a stoichiometric phase's), with an amount at rounding level. (A phase that holds a trace
+# component holds a large fraction of it and stays.)
+NEGLIGIBLE_SHARE = 1e-9
+
+
+def _drop_negligible(result):
+    phs, Y, X, n, G = result
+    if len(phs) < 2:
+        return result
+    X_arr = np.asarray(X, dtype=float); n_arr = np.asarray(n, dtype=float)
+    totals = n_arr @ X_arr
+    keep = [a for a in range(len(phs))
+            if np.any(n_arr[a] * X_arr[a] > NEGLIGIBLE_SHARE * np.maximum(totals, 1e-300))]
+    if not keep:
+        return result
+    return [phs[k] for k in keep], [Y[k] for k in keep], [X[k] for k in keep], [n[k] for k in keep], [G[k] for k in keep]
+
+
 # Mole-fraction conditions below this are trace conditions: the master problem's duals for such a row are set by
 # amounts ~1e-10 and are unusable, so the point is first solved with the trace values raised to TRACE_START and then
 # followed down to them by Newton (dropping phases whose amounts reach zero), and certified there.
@@ -734,7 +754,7 @@ def _solve_workspace(wks, threads):
 
     def write(idx, out):
         status, phs, Ys, Xs, ns, Gs, mu, rounds = out
-        phs, Ys, Xs, ns, Gs = _consolidate((list(phs), list(Ys), list(Xs), list(ns), list(Gs)))
+        phs, Ys, Xs, ns, Gs = _drop_negligible(_consolidate((list(phs), list(Ys), list(Xs), list(ns), list(Gs))))
         # vertex order as the reference's (its hull lists grid points, which are grouped by sorted phase name)
         perm = sorted(range(len(phs)), key=lambda a: (names[phs[a]], tuple(-Xs[a])))
         phs, Ys, Xs, ns, Gs = ([seq[a] for a in perm] for seq in (phs, Ys, Xs, ns, Gs))

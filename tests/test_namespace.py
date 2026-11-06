@@ -81,14 +81,20 @@ def test_cg_mode_is_per_thread_and_restores(cg_calls):
     results = {}
 
     def cg_thread():
-        with pyc.cg_mode():
-            results['cg'] = pycalphad.equilibrium(*args)   # pycalphad's own function, in cg mode
+        try:
+            with pyc.cg_mode():
+                results['cg'] = pycalphad.equilibrium(*args)   # pycalphad's own function, in cg mode
+                inside.set()
+                release.wait(60)
+        except BaseException as err:
+            results['error'] = err
             inside.set()
-            release.wait(60)
 
     worker = threading.Thread(target=cg_thread)
     worker.start()
     assert inside.wait(120)
+    if 'error' in results:
+        raise results['error']
     assert _hooked_names() != before                       # the names are redirected while a thread is in cg mode
     assert cg_calls['workspace'] == 1
     results['plain'] = pycalphad.equilibrium(*args)        # another thread meanwhile: pycalphad's own solver

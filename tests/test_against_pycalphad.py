@@ -187,7 +187,9 @@ def test_trace_compositions_in_any_form(condition):
     ref = Workspace(dbf, ['AL', 'FE', 'VA'], ['LIQUID'], conds).eq
     cg = CGWorkspace(dbf, ['AL', 'FE', 'VA'], ['LIQUID'], conds).eq
     np.testing.assert_allclose(cg.X.ravel()[:2], ref.X.ravel()[:2], rtol=1e-4)
-    np.testing.assert_allclose(cg.MU.ravel(), ref.MU.ravel(), atol=0.1)
+    # (1 J/mol = RT 1e-4 in the trace component's potential: a trace of 1e-10 given as 1 - X is only defined to
+    # ~1e-6 relative in double precision, and pycalphad's own result there varies by ~0.2 J/mol between platforms)
+    np.testing.assert_allclose(cg.MU.ravel(), ref.MU.ravel(), atol=1.0)
 
 
 @pytest.mark.parametrize('y_mg', [0.1, 0.3])
