@@ -27,6 +27,9 @@ jobs:
           CIBW_ARCHS_MACOS: x86_64 arm64
           CIBW_ARCHS_WINDOWS: auto64
           CIBW_TEST_REQUIRES: pytest
+          # (pycalphad 0.11.2 needs symengine < 0.14, which has no Python 3.14 wheels; 3.14 is tested against
+          # pycalphad's develop branch in the Tests workflow)
+          CIBW_TEST_SKIP: "cp314-*"
           CIBW_TEST_COMMAND: pytest {project}/tests/test_namespace.py {project}/tests/test_against_pycalphad.py -q -k "not threads"
       - uses: actions/upload-artifact@v7
         with:
