@@ -17,7 +17,7 @@ import warnings
 
 from pycalphad_cg._options import options
 
-__all__ = ['cg_mode', 'in_cg_mode']
+__all__ = ['cg_mode', 'in_cg_mode', 'fallback_or_raise']
 
 _local = threading.local()
 _lock = threading.Lock()
@@ -55,8 +55,24 @@ def _cg_global_min(original, *args, **kwargs):
     arguments = bound.arguments
     try:
         return global_min_candidate(arguments['point'], arguments['system_info'], arguments['tol'])
-    except CGCapabilityError:
+    except CGCapabilityError as err:
+        fallback_or_raise(err)
         return original(*args, **kwargs)
+
+
+def fallback_or_raise(err):
+    """For a problem column generation does not handle (CGCapabilityError ``err``) in a path that would use
+    pycalphad's solver instead: warn if fallback is allowed (the calling thread's cg_mode setting, else
+    ``options.fallback``), else raise. pycalphad's mapping catches every exception from its solver and goes on, so
+    the error is also kept and raised again when the outermost cg_mode block ends."""
+    fallback = _settings()[1] if in_cg_mode() else options.fallback
+    if fallback:
+        warnings.warn(f'column generation does not handle this problem ({err}); using pycalphad\'s solver',
+                      stacklevel=3)
+        return
+    if in_cg_mode() and getattr(_local, 'error', None) is None:
+        _local.error = err
+    raise err
 
 
 def _targets():
@@ -108,6 +124,10 @@ def cg_mode(threads=None, fallback=None):
     Inside this context, pycalphad's ``equilibrium`` and mapping (strategies, ``binplot``, ``ternplot``) called from
     this thread use column generation. ``threads`` and ``fallback`` default to ``pycalphad_cg.options`` (an outer
     cg_mode's values, when nested).
+
+    With fallback off, a problem column generation does not handle raises CGCapabilityError where it occurs, and
+    again when the outermost block ends: pycalphad's mapping catches every error from its solver and goes on, so the
+    first such error is kept and raised there even if it was caught inside the block.
     """
     global _users
     previous = getattr(_local, 'settings', None)
@@ -119,14 +139,22 @@ def cg_mode(threads=None, fallback=None):
             _install()
         _users += 1
     _local.settings = (threads, fallback)
+    if previous is None:
+        _local.error = None
     try:
         yield
     finally:
         _local.settings = previous
+        error = getattr(_local, 'error', None) if previous is None else None
+        if previous is None:
+            _local.error = None
         with _lock:
             _users -= 1
             if _users == 0:
                 _uninstall()
+    if error is not None:
+        # (a problem column generation does not handle, with fallback off, that pycalphad's code caught)
+        raise error
 
 
 def run_in_cg_mode(function):

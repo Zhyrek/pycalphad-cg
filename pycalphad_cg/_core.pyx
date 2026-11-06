@@ -35,6 +35,20 @@ cdef double R_GAS = 8.3145
 _COMPILE_LOCK = threading.Lock()
 
 
+cdef void _nan_outputs(double* out, const double* inp, void* size) noexcept nogil:
+    """Stand-in for a function that failed to compile: NaN in all (*size) outputs."""
+    cdef int k
+    for k in range((<int*>size)[0]):
+        out[k] = NAN
+
+
+def check_errors(phases):
+    """Raise the first error from loading a phase's compiled functions (see CPhase.ensure_derivatives)."""
+    for P in phases:
+        if (<CPhase>P).load_error is not None:
+            raise (<CPhase>P).load_error
+
+
 cdef object _pointers(object compiled, fn_t* f, void** data):
     """The C function and its data pointer of a function compiled by SymEngine (``as_ctypes``, the route pycalphad's
     own FastFunction takes). Returns the objects that must stay alive while the pointers are used."""
@@ -85,6 +99,9 @@ cdef class CPhase:
     cdef public long evals1, evals2, nprice, nfail, nescape, nsaddle
     cdef bint last_indef                  # the last factor() found the Hessian indefinite
     cdef bint refine                      # price(): one more Newton step after converging (see price)
+    cdef public int npinned               # species held at the floor (set_pinned)
+    cdef public object load_error         # exception from compiling the derivatives (see ensure_derivatives)
+    cdef int nout_grad, nout_hess         # output sizes of the derivative functions (for _nan_outputs)
     cdef int[::1] sym_a, sym_b            # species pairs (sym_a[k], sym_b[k]) of sublattice pairs with the same species
     cdef int nsym                         #   (sym_off: where each sublattice pair's species start)
     cdef int[::1] sym_off
@@ -130,7 +147,9 @@ cdef class CPhase:
         self.elem_of = np.asarray(elem_of, dtype=np.int32).copy()
         self.single = (counts == 1).astype(np.int32)
         self.stoich = bool(np.all(counts == 1))
-        self.pinned = np.zeros(D, dtype=np.int32)
+        self.pinned = np.zeros(D, dtype=np.int32); self.npinned = 0
+        self.load_error = None
+        self.nout_grad = self.ns + D; self.nout_hess = (self.ns + D) * (self.ns + D)
         self.A = np.array(A, dtype=float); self.asum = np.asarray(A).sum(axis=0)
         EE = np.array(E, dtype=float).reshape(-1, D)
         self.ne_fixed = EE.shape[0]
@@ -179,9 +198,21 @@ cdef class CPhase:
         self.p_grad = pg   # (last: ensure_derivatives tests it)
 
     cdef inline void ensure_derivatives(self) noexcept nogil:
+        """Load the derivatives on first use. This runs inside nogil code that cannot propagate exceptions: if
+        loading fails, the derivatives evaluate to NaN (no point is then accepted) and the error is kept in
+        load_error, which the Solver's Python entry points raise (check_errors)."""
+        # (no Python objects in this function: their clean-up would take the GIL on every call)
         if self.p_grad == NULL:
-            with gil:
-                self._load_derivatives()
+            self._load_or_fail()
+
+    cdef void _load_or_fail(self) noexcept with gil:
+        try:
+            self._load_derivatives()
+        except BaseException as err:
+            self.load_error = err
+            self.d_grad = <void*>&self.nout_grad; self.d_hess = <void*>&self.nout_hess
+            self.p_hess = _nan_outputs
+            self.p_grad = _nan_outputs
 
     def __dealloc__(self):
         free(self.p_m); free(self.p_mg); free(self.p_mh); free(self.d_m); free(self.d_mg); free(self.d_mh)
@@ -225,6 +256,7 @@ cdef class CPhase:
         """Species held at the site-fraction floor (phase-local site-fraction conditions at 0, or at 1 for another
         species of the sublattice)."""
         self.pinned = np.asarray(mask, dtype=np.int32).copy()
+        self.npinned = int(np.count_nonzero(self.pinned))
         self.has_last = False
 
     def set_bounds(self, double m_lo):
@@ -907,7 +939,7 @@ cdef class Solver:
     cdef double[::1] PG, b, mf
     cdef int[::1] Pph, Pnext, head, basis, ipiv, fixed
     cdef long[::1] Pcode
-    cdef public double RT
+    cdef public double RT, bigM
     cdef double[::1] mu, dual, xB, LU, tmp, cB, ybuf, xbuf, ybest, xbest, ystart, colbuf, ycert
     cdef public long lp_iters, priced, skipped, npolish, npolish_try, nunpolished
     cdef public bint use_polish, last_polished
@@ -941,6 +973,7 @@ cdef class Solver:
         self.prune_late = prune_late; self.max_late = max_late; self.seed_prune = seed_prune
         self.use_polish = True
         self.gauge = None; self.ngauge = 0; self.gauge_mv = np.zeros((1, C))
+        self.bigM = 1e3
         self.lp_iters = 0; self.priced = 0; self.skipped = 0; self.npolish = 0; self.npolish_try = 0; self.nunpolished = 0
         self.pol_y = np.zeros(C * self.Dmax); self.pol_x = np.zeros(C * C); self.pol_S = np.zeros(C * C * C)
         self.pol_J = np.zeros(4 * C * C); self.pol_F = np.zeros(2 * C); self.pol_mu = np.zeros(C)
@@ -983,7 +1016,7 @@ cdef class Solver:
         rc = []
         for var in basis:
             if var < 0:
-                rc.append(1e3 - self.dual[-(1 + var)])
+                rc.append(self.bigM - self.dual[-(1 + var)])
             else:
                 rc.append(self.PG[var] / self.RT - float(np.dot(np.asarray(self.mu), np.asarray(self.Px[var]))))
         return basis, xB, np.asarray(self.mu) * self.RT, np.array(rc)
@@ -1102,7 +1135,8 @@ cdef class Solver:
         cdef double M
         for r in range(Y.shape[0]):
             P.eval0(&Y[r, 0])
-            if P.Mtot < P.m_lo or P.ne > 0: continue   # (constrained phases: only points from pricing are stored)
+            if P.Mtot < P.m_lo or P.ne > 0 or P.npinned > 0:
+                continue   # (constrained phases, including pinned species: only points from pricing are stored)
             for j in range(self.C): self.xbuf[j] = P.mval[j] / P.Mtot
             self.add_point(ph, &Y[r, 0], &self.xbuf[0], P.out1[0])
 
@@ -1110,7 +1144,7 @@ cdef class Solver:
         cdef double c
         cdef int i
         if j < 0:
-            return 1e3
+            return self.bigM
         c = self.PG[j] / self.RT
         for i in range(self.C): c -= self.mf[i] * self.Px[j, i]
         return c
@@ -1127,13 +1161,21 @@ cdef class Solver:
                 out[k] = s
 
     cdef int lp_solve(self, double* obj) noexcept nogil:
-        """Revised primal simplex (artificial identity columns at cost 1e3), warm-started from the previous basis.
-        Leaves the chemical potentials (RT units) in self.mu: R^T duals + the fixed ones. Returns 0 on success."""
+        """Revised primal simplex (artificial identity columns), warm-started from the previous basis. Leaves the
+        chemical potentials (RT units) in self.mu: R^T duals + the fixed ones. Returns 0 on success.
+
+        The artificial columns' cost (big M) is set above every stored point's cost by a wide margin (it must exceed
+        any physical column's: with a fixed M, energies far from zero, e.g. a shifted reference, would leave
+        artificial columns in the optimum of a feasible problem)."""
         cdef int K = self.K, C = self.C, it, i, k, j, q, leave, info, nrhs = 1, n = self.K
         cdef double best, t, tmin, s, piv
         cdef char N = b'N', T = b'T'
         cdef bint bland = False
         cdef int resets = 0
+        self.bigM = 1e3
+        for j in range(self.npts):
+            s = fabs(self.cost(j))
+            if 1e3 + 10.0 * s > self.bigM: self.bigM = 1e3 + 10.0 * s
         for it in range(20000):
             self.lp_iters += 1
             for k in range(K):
@@ -1173,7 +1215,7 @@ cdef class Solver:
             # one could re-enter in place of itself indefinitely)
             q = 0; best = -1e-10 * s; leave = -2
             for k in range(K):
-                s = 1e3 - self.dual[k]
+                s = self.bigM - self.dual[k]
                 if s < best and not self.is_basic(-(1 + k)):
                     best = s; q = -(1 + k); leave = -1
                     if bland: break

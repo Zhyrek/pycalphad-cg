@@ -100,9 +100,9 @@ with every test inside `cg_mode()` and `pycalphad.Workspace` replaced:
 | pycalphad | plain | with column generation | column-generation solves | fallbacks |
 |---|---|---|---|---|
 | 0.11.2 | 309 passed, 2 skipped, 1 xfailed | 309 passed, 2 skipped, 1 xfailed | 173 | 5 |
-| develop (0cbc613c0) | DEV_PLAIN | DEV_CG | DEV_SOLVES | DEV_FALLBACKS |
+| develop (0cbc613c0) | 395 passed, 2 skipped, 1 xfailed, 1 xpassed | 395 passed, 2 skipped, 1 xfailed, 1 xpassed | 204 | 6 |
 
-The fallbacks are the tests that pass their own solver object (see Limits).
+The fallbacks are the tests that pass their own or a configured solver object (see Limits). (Apple M4, Python 3.12, SymEngine 0.14.1.)
 
 **This package's tests** (`pytest tests`) compare with pycalphad on binaries and ternaries from pycalphad's test
 databases:
@@ -117,19 +117,51 @@ databases:
 
 ## Performance
 
-PERFORMANCE_TABLE
+`examples/timing.py` on an Apple M4 (10 cores): wall time per call, warm (the first call, which compiles the
+phases' energy functions, is not timed), including building the Workspace (its models and phase records), which
+is the same for both. The last column is the largest amount by which column generation's Gibbs energy is below
+pycalphad's; it is never above pycalphad's by more than 0.0014 J/mol.
+
+| System | Conditions | pycalphad develop | cg, 1 thread | cg, 10 threads | pycalphad 0.11.2 | cg lower by, at most (J/mol) |
+|---|---|---|---|---|---|---|
+| Al-Ni (alni_dupin_2001), 1200 K | 500 | 0.17 s | 0.07 s | 0.04 s | 0.28 s | 7e-5 |
+| Al-Fe (Al-Fe_sundman2009), 900 K | 500 | 1.27 s | 0.43 s | 0.16 s | 1.55 s | 39 |
+| Al-Fe (alfe), 500–1900 K | 15 × 25 | 0.12 s | 0.05 s | 0.03 s | 0.19 s | 22 |
+| Al-Cr-Ni (alcrni), 1273 K | 25 × 25 | 0.40 s | 0.15 s | 0.06 s | 0.62 s | 150 |
+| COST507 Al-Mg-Si-Cu-Zn, 800 K | 100 | 0.69 s | 0.44 s | 0.44 s | 1.57 s | 4e-6 |
+| COST507, 10 elements, 800 K | 100 | 6.81 s | 2.62 s | 2.67 s | 21.0 s | 5e-4 |
+
+(cg's times are the same on both pycalphad versions; the 0.11.2 column is pycalphad's own solver there.)
+
+- **Where column generation is lower,** pycalphad's default grid (`pdens` 60) misses a state, and the state is
+  real: re-evaluating column generation's phases with `pycalphad.calculate` at its site fractions gives its
+  energy. Examples: Al-Fe at 700 K, x(Al) = 0.14, the ordered state of B2_BCC (22 J/mol lower); Al-Cr-Ni at
+  1273 K, x(Al) = 0.14, x(Cr) = 0.18, L1<sub>2</sub> + L1<sub>2</sub> where pycalphad finds one L1<sub>2</sub> (152 J/mol
+  lower). On a 0.01 grid of Al-Cr-Ni at 1273 K, column generation is lower than pycalphad even at `pdens`
+  1000 at 1224 of 5050 compositions, by up to 512 J/mol (B2 + liquid at x(Al) = 0.665 on the Al-Cr edge, where
+  pycalphad finds B2 alone), and never higher.
+- **Threads** pay off from a few hundred conditions; at 100 conditions the fixed cost of building the Workspace
+  dominates.
+- **Mapping** with column generation took 2.2 s against pycalphad's 2.9 s for an Al-Ni binary (1000–2000 K), and
+  2.3 s against 3.6 s for the Al-Cr-Ni isotherm at 1273 K.
 
 ## Limits
 
 - **Fallback to pycalphad's solver** (with a warning; `fallback=False` raises `CGCapabilityError` instead):
   - `calc_opts` other than `pdens`;
-  - custom solver objects (pycalphad's grid-and-hull starting points would be skipped, so that solver would never
-    see them) and custom phase-record factories;
+  - custom solver objects, or pycalphad's `Solver` with non-default settings (pycalphad's grid-and-hull starting
+    points would be skipped, so that solver would never see them), and custom phase-record factories;
   - a phase without a temperature state variable, or with non-linear internal constraints;
   - conditions other than T, P, N, mole and mass fractions, chemical potentials and linear combinations of mole
     fractions;
   - phase-local conditions other than site fractions and mole fractions, or a phase-local mole fraction in a phase
     whose formula moles depend on its site fractions (ionic liquids).
+- **`fallback=False` in mapping:** pycalphad's mapping catches every error from its solver and goes on, so the
+  `CGCapabilityError` is raised again when the outermost `cg_mode` block (or `binplot`, a strategy method, ...)
+  ends.
+- **Two descriptions of one phase** (e.g. an ordered model in its disordered state and the disordered model) are
+  recognized in mapping by equal composition and equal energy (within 5 J/mol) also 100 K away. Two different
+  phases at the same composition whose entropies differ by less than about 0.05 J/mol/K would be taken for one.
 - **Properties that solve their own sub-problems** (`DormantPhase`, `T0`, driving forces through
   `pycalphad.property_framework`) use pycalphad's Newton solver on the composition sets the equilibrium returned,
   as in pycalphad.
@@ -138,6 +170,13 @@ PERFORMANCE_TABLE
   `pycalphad_cg.mapping.strategy.binary_strategy.BinaryStrategy` is pycalphad's own class.
 - **One calculation at a time per process.** The compiled phases are cached across calls and shared, so concurrent
   calls from several threads run one after the other (each uses its own worker threads).
+
+## Where results differ from pycalphad
+
+- Gibbs energies lower than pycalphad's where its grid misses a state (see Performance).
+- Ratio conditions such as `v.X('NI') / v.X('ZN')` in systems with more components than the ratio names: pycalphad's
+  own solver takes the denominator's column by its position among the condition's symbols rather than by element,
+  so its result does not meet the condition in some systems; column generation meets it.
 
 ## Compatibility
 

@@ -110,3 +110,25 @@ def test_settings_nest(monkeypatch):
     with pyc.cg_mode():
         assert _cgmode._settings()[0] == 3
     assert not _cgmode.in_cg_mode()
+
+
+def test_aliases_keep_pycalphads_module_specs():
+    "Importing a module through pycalphad_cg leaves pycalphad's module as it was (resources, reloading)."
+    from importlib.resources import files
+    import pycalphad.tests.databases as databases
+    spec = databases.__spec__
+    import pycalphad_cg.tests.databases as aliased
+    assert aliased is databases and databases.__spec__ is spec
+    assert files('pycalphad.tests.databases').joinpath('alfe.tdb').is_file()
+    assert files('pycalphad_cg.tests.databases').joinpath('alfe.tdb').is_file()
+
+
+def test_strategy_classes_keep_their_hierarchy_and_pickle():
+    import pickle
+    for name in ['BinaryStrategy', 'TernaryStrategy', 'IsoplethStrategy', 'StepStrategy']:
+        if hasattr(pycalphad.mapping, name):
+            cls = getattr(pyc.mapping.strategy, name)
+            assert issubclass(cls, pyc.mapping.strategy.MapStrategy)
+            assert issubclass(cls, pycalphad.mapping.strategy.MapStrategy)
+            assert pickle.loads(pickle.dumps(cls)) is cls
+    assert pickle.loads(pickle.dumps(pyc.mapping.strategy.MapStrategy)) is pyc.mapping.strategy.MapStrategy

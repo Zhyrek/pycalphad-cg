@@ -140,9 +140,7 @@ class _Phase:
         out = [self.composition_start(z, elements)]
         for k in range(C):
             out.append(self.composition_start(0.4 * np.asarray(z) + 0.6 * np.eye(C)[k], elements))
-        ems = list(itertools.product(*[range(len(b)) for b in self.blocks]))
-        if len(ems) > MAX_ORDERED_SEEDS:
-            ems = [ems[i] for i in rng.choice(len(ems), MAX_ORDERED_SEEDS, replace=False)]
+        ems = _end_member_sample(self.blocks, MAX_ORDERED_SEEDS, rng)
         end_members = []
         for em in ems:
             y = np.full(self.D, 1e-6)
@@ -174,6 +172,31 @@ class _Phase:
         if self.m_lo > 0:
             out = [y for y in out if self.A.sum(axis=0) @ y >= self.m_lo]
         return out
+
+
+def _end_member_sample(blocks, limit, rng):
+    """End members (one species index per sublattice): all of them if there are at most `limit`, else `limit`
+    distinct ones at random (drawn as indices into the product, which is never built)."""
+    sizes = [len(b) for b in blocks]
+    total = 1
+    for n in sizes:
+        total *= n
+    if total <= limit:
+        return list(itertools.product(*[range(n) for n in sizes]))
+    picks = set()
+    while len(picks) < limit:
+        picks.add(int(rng.integers(total)) if total < 2 ** 62 else tuple(int(rng.integers(n)) for n in sizes))
+    out = []
+    for code in sorted(picks, key=str):
+        if isinstance(code, tuple):
+            out.append(code)
+            continue
+        em = []
+        for n in reversed(sizes):
+            code, k = divmod(code, n)
+            em.append(k)
+        out.append(tuple(reversed(em)))
+    return out
 
 
 def _sample_dof(pr, blocks, rng):
@@ -242,11 +265,27 @@ _PHASE_CACHE = OrderedDict()
 _PHASE_CACHE_SIZE = 1024
 
 
+def _species_key(sp):
+    return (str(sp.name), tuple(sorted((str(k), float(val)) for k, val in sp.constituents.items())),
+            float(getattr(sp, 'charge', 0) or 0))
+
+
 def _phase_key(prf, name, elements):
+    """What determines a phase's compiled functions and structure: the energy (``ast``, which is ``Model.G``), the
+    site fractions with their species' constituents and charges and the site ratios (with those, a standard Model's
+    formula moles and internal constraints), the state variables and parameter symbols. A Model class that defines
+    its own formula moles or constraints contributes those expressions too."""
+    from pycalphad import Model
     mod = prf.models[name]
-    return (type(mod), name, tuple(str(c) for c in prf.comps), tuple(elements),
-            tuple(str(sv) for sv in prf.state_variables), tuple(str(p) for p in prf.param_symbols),
-            tuple(str(y) for y in mod.site_fractions), mod.ast)
+    key = (type(mod), name, tuple(_species_key(c) for c in prf.comps), tuple(elements),
+           tuple(str(sv) for sv in prf.state_variables), tuple(str(p) for p in prf.param_symbols),
+           tuple((str(y), _species_key(y.species)) for y in mod.site_fractions),
+           tuple(float(r) if not hasattr(r, 'free_symbols') else r for r in mod.site_ratios), mod.ast)
+    if type(mod).moles is not Model.moles:
+        key += (tuple(mod.moles(el, per_formula_unit=True) for el in elements),)
+    if type(mod).get_internal_constraints is not Model.get_internal_constraints:
+        key += (tuple(mod.get_internal_constraints()),)
+    return key
 
 
 def _phases_for(prf, elements):
@@ -270,17 +309,39 @@ def _phases_for(prf, elements):
     return phases
 
 
-def _gauge_directions(phases, C):
-    """Orthonormal directions w with w.x = 0 for every admissible composition of every phase (see Solver.set_gauge).
-    With linear formula moles m = A y on the affine set {B y = c} (site balances and the phase's constraints),
-    w.x vanishes everywhere iff w is orthogonal to A y0 (y0 any point of the set) and to A N (N spanning B's null
-    space). Phases with non-linear formula moles are taken to allow no such direction."""
+def _raise_load_errors(phases):
+    """Raise an error from compiling a phase's derivatives (see CPhase.ensure_derivatives), after evicting the
+    affected phases from the cache (the error may be transient, e.g. memory)."""
+    from pycalphad_cg._core import check_errors
+    failed = [ph for ph in phases if any(c.load_error is not None for c in [ph.core] + ph.clones)]
+    if failed:
+        for key in [k for k, ph in _PHASE_CACHE.items() if ph in failed]:
+            del _PHASE_CACHE[key]
+        check_errors([c for ph in failed for c in [ph.core] + ph.clones])
+
+
+def _gauge_directions(phases, C, local=None):
+    """Orthonormal directions w with w.x = 0 for every admissible composition of every phase (see Solver.set_gauge):
+    along them the chemical potentials are not determined, and the solver keeps them at zero (the minimum-norm
+    potentials, as pycalphad returns). With linear formula moles m = A y on the affine set {B y = c} (site balances,
+    the phase's constraints, and `local`: per phase (E, e, pinned) of the phase-local conditions), w.x vanishes
+    everywhere iff w is orthogonal to A y0 (y0 any point of the set) and to A N (N spanning B's null space). Phases
+    with non-linear formula moles are taken to allow no such direction."""
     rows = []
-    for ph in phases:
+    for i, ph in enumerate(phases):
         if not ph.linear:
             return np.zeros((0, C))
-        B = np.vstack([np.isin(np.arange(ph.D), blk).astype(float) for blk in ph.blocks] + ([ph.E] if len(ph.E) else []))
-        c = np.concatenate([np.ones(len(ph.blocks)), ph.e if len(ph.E) else np.zeros(0)])
+        E = [ph.E] if len(ph.E) else []
+        e = [ph.e] if len(ph.E) else []
+        if local is not None:
+            El, el, pinned = local[i]
+            if len(El):
+                E.append(np.asarray(El, dtype=float).reshape(-1, ph.D)); e.append(np.asarray(el, dtype=float))
+            for j in np.flatnonzero(pinned):
+                row = np.zeros((1, ph.D)); row[0, j] = 1.0
+                E.append(row); e.append(np.zeros(1))
+        B = np.vstack([np.isin(np.arange(ph.D), blk).astype(float) for blk in ph.blocks] + E)
+        c = np.concatenate([np.ones(len(ph.blocks))] + e)
         y0 = np.linalg.lstsq(B, c, rcond=None)[0]
         _, sv, vt = np.linalg.svd(B)
         rank = int(np.sum(sv > 1e-10 * max(sv[0], 1.0)))
@@ -324,7 +385,9 @@ def _condition_rows(point, elements, molar_masses):
             if cond.denominator == 1:
                 rows.append(c); rhs.append((value - float(constant)) * N)
             else:
-                c[cond.symbols.index(cond.denominator)] -= value
+                # (numerator sum c.x + constant = value * denominator; pycalphad's own Solver indexes the
+                # denominator's coefficient by its position among the condition's symbols instead)
+                c[elements.index(str(cond.denominator)[2:])] -= value
                 rows.append(c); rhs.append(-float(constant) * N)
         else:
             raise CGCapabilityError(f'condition {cond}')
@@ -415,27 +478,63 @@ def _is_global_x(cond):
     return isinstance(cond, v.MoleFraction) and cond.phase_name is None
 
 
-def _solve_trace(solver, point, elements, molar_masses, seeds):
-    """Solve with trace mole fractions raised, then follow them down by Newton and certify; None if that fails."""
-    trace = [k for k, val in point.items() if _is_global_x(k) and float(val) < TRACE_COMPOSITION]
-    start = OrderedDict(point)
-    for k in trace:
-        start[k] = TRACE_START
-    if sum(float(val) for k, val in start.items() if _is_global_x(k)) >= 1:
+def _implied_composition(R, b, fixed):
+    """The overall composition the condition rows fix (R x = b, the first row being N), or None if they do not fix
+    one (fixed chemical potentials, or fewer composition conditions than components)."""
+    if fixed.any() or R.shape[0] != R.shape[1]:
         return None
-    R, b, mu_fixed, fixed = _condition_rows(start, elements, molar_masses)
+    try:
+        z = np.linalg.solve(R, b)
+    except np.linalg.LinAlgError:
+        return None
+    return z / b[0]
+
+
+def _trace_target(R, b, fixed):
+    """The implied overall composition (see _implied_composition) if any component in it is a trace (below
+    TRACE_COMPOSITION), else None."""
+    z = _implied_composition(R, b, fixed)
+    if z is None or not np.all(np.isfinite(z)) or z.min() >= TRACE_COMPOSITION:
+        return None
+    return z
+
+
+def _solve_trace(solver, point, elements, molar_masses, seeds, z):
+    """Conditions fixing an overall composition z with trace components (whatever form they take: mole or mass
+    fractions, the dependent component, linear combinations): solve the same equilibrium with z as mole-fraction
+    conditions, the trace values raised to TRACE_START, then follow them down by Newton and certify; None if that
+    fails."""
+    C = len(elements)
+    dependent = int(np.argmax(z))
+    base = OrderedDict((k, val) for k, val in point.items()
+                       if k in (v.N, v.P, v.T) or getattr(k, 'phase_name', None) is not None)
+    trace = [i for i in range(C) if i != dependent and z[i] < TRACE_COMPOSITION]
+    z = np.clip(z, 0.0, None)
+
+    def rows(zz):
+        pt = OrderedDict(base)
+        for i in range(C):
+            if i != dependent:
+                pt[v.X(elements[i])] = float(zz[i])
+        return _condition_rows(pt, elements, molar_masses)
+
+    start = z.copy()
+    start[trace] = TRACE_START
+    if sum(start[i] for i in range(C) if i != dependent) >= 1:
+        return None
+    R, b, mu_fixed, fixed = rows(start)
     solver.set_conditions(R, b, mu_fixed, fixed)
     out = solver.solve(seeds)
     if out[0] != 0 or not solver.last_polished:
         return None
-    decades = max(np.log10(TRACE_START / max(float(point[k]), 1e-300)) for k in trace)
+    decades = max(np.log10(TRACE_START / max(z[i], 1e-300)) for i in trace) if trace else 0.0
     nsteps = max(int(np.ceil(decades / 2)), 1)
     for step in range(1, nsteps + 1):
         frac = step / nsteps
-        cur = OrderedDict(point)
-        for k in trace:
-            cur[k] = float(np.exp((1 - frac) * np.log(TRACE_START) + frac * np.log(max(float(point[k]), 1e-300))))
-        R, b, mu_fixed, fixed = _condition_rows(cur, elements, molar_masses)
+        cur = z.copy()
+        for i in trace:
+            cur[i] = float(np.exp((1 - frac) * np.log(TRACE_START) + frac * np.log(max(z[i], 1e-300))))
+        R, b, mu_fixed, fixed = rows(cur)
         if not solver.polish_from_state(R, b, mu_fixed, fixed):
             return None
     return solver.certify()
@@ -486,8 +585,9 @@ def _solve_point(solver, point, elements, molar_masses, seeds, guess):
     R, b, mu_fixed, fixed = _condition_rows(point, elements, molar_masses)
     if fixed.any():
         return _solve_fixed_potentials(solver, point, elements, molar_masses, seeds, guess)
-    if any(_is_global_x(k) and float(val) < TRACE_COMPOSITION for k, val in point.items()):
-        out = _solve_trace(solver, point, elements, molar_masses, seeds)
+    z = _trace_target(R, b, fixed)
+    if z is not None:
+        out = _solve_trace(solver, point, elements, molar_masses, seeds, z)
         if out is not None:
             return out
     solver.set_conditions(R, b, mu_fixed, fixed)
@@ -516,12 +616,12 @@ def _thread_count(n_conditions, threads=None):
 
 class _Worker:
     """A solver over its own copies of the phases (one per thread)."""
-    def __init__(self, index, phases, C, gauge):
+    def __init__(self, index, phases, C):
         from pycalphad_cg._core import Solver
         self.index = index
+        self.C = C
         self.cores = [ph.core_for(index) for ph in phases]
         self.solver = Solver(self.cores, C)
-        self.solver.set_gauge(gauge)
         self.guess = {}   # trial mole fractions for fixed-potential components, carried between points
         self.state_key = None
         self.seed_key = None   # (state_key without T, T) at the last seeding
@@ -536,12 +636,16 @@ class _Worker:
             return None
         if key != self.state_key:
             same_local = self.state_key is not None and key[2] == self.state_key[2]
+            local = []
             for ph, core in zip(phases, self.cores):
                 core.set_state(sv_values, params)
                 if not same_local:
                     E, e, pinned = _local_constraints(ph, point, elements)
                     core.set_local_constraints(E, e)
                     core.set_pinned(pinned)
+                    local.append((E, e, pinned))
+            if not same_local:
+                self.solver.set_gauge(_gauge_directions(phases, self.C, local))
             self.state_key = key
         if snapshot is not None:
             self.solver.reset_points()
@@ -598,9 +702,8 @@ def _solve_workspace(wks, threads):
             raise CGCapabilityError(f'free state variable {sv}')
     phases = _phases_for(prf, elements)
     names = [ph.name for ph in phases]
-    params = np.asarray(prf.param_values, dtype=float)
+    params = np.array(prf.param_values, dtype=float)   # (a copy: the factory can be shared and updated)
     molar_masses = np.asarray(prf.molar_masses, dtype=float)
-    gauge = _gauge_directions(phases, C)
 
     keys = list(conds.keys())
     shape = tuple(len(conds[k]) for k in keys)
@@ -651,8 +754,7 @@ def _solve_workspace(wks, threads):
         rng = np.random.default_rng(0)
         seeds = worker.prepare(phases, items[0][1], sv_values, params, elements, snapshot, rng, carry, t_index)
         rows = [_condition_rows(point, elements, molar_masses) for _, point in items]
-        plain = all(not r[3].any() for r in rows) and not any(
-            _is_global_x(k) and float(val) < TRACE_COMPOSITION for _, point in items for k, val in point.items())
+        plain = all(not r[3].any() and _trace_target(r[0], r[1], r[3]) is None for r in rows)
         if plain and len(items) > 1:
             # ordinary conditions: the whole sequence in C without the GIL; failures are retried below
             args = (np.array([r[0] for r in rows]), np.array([r[1] for r in rows]), np.array([r[2] for r in rows]),
@@ -687,7 +789,7 @@ def _solve_workspace(wks, threads):
     t_index = next((i for i, sv in enumerate(state_variables) if str(sv) == 'T'), None)
     n_conditions = sum(len(g[2]) for g in groups)
     nthreads = _thread_count(n_conditions, threads)
-    workers = [_Worker(i, phases, C, gauge) for i in range(nthreads)]
+    workers = [_Worker(i, phases, C) for i in range(nthreads)]
     if nthreads == 1:
         for g, (key, sv_values, items) in enumerate(groups):
             run(workers[0], sv_values, items, None, carry=g > 0)
@@ -735,6 +837,7 @@ def _solve_workspace(wks, threads):
                     for f in futures:
                         f.result()
 
+    _raise_load_errors(phases)
     coords = OrderedDict((str(k), conds[k]) for k in keys)
     coords['vertex'] = np.arange(nvert)
     coords['component'] = elements

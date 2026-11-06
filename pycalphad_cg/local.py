@@ -17,7 +17,9 @@ from pycalphad import variables as v
 from pycalphad.core.composition_set import CompositionSet
 from pycalphad.core.constants import COMP_DIFFERENCE_TOL
 from pycalphad.core.solver import Solver, SolverBase, SolverResult
-from pycalphad_cg.solve import _phases_for, _condition_rows, _local_constraints, CGCapabilityError, SOLVE_LOCK
+from pycalphad_cg import _cgmode
+from pycalphad_cg.solve import (_phases_for, _condition_rows, _local_constraints, _raise_load_errors,
+                                CGCapabilityError, SOLVE_LOCK)
 
 __all__ = ['CGSolver', 'global_min_candidate']
 
@@ -38,9 +40,10 @@ JUMP_RATIO = 10.0
 JUMP_X = 0.1
 JUMP_X_RATIO = 5.0
 # global_min_candidate: a candidate close to a stable composition set's composition with a tiny driving force is not
-# a new phase: within TIE_X_NEAR (mole fraction) and below TIE_DG (J/mol), that set's state in another description (a
-# tie at rounding level); within TIE_X and below TIE_DG_FAR, the other side of a miscibility gap that has just closed
-# at its critical point. A phase that really appears there gains driving force quickly and is found at the next step
+# a new phase if it is that set's own phase or an equivalent description of it (see _equivalent_description): within
+# TIE_X_NEAR (mole fraction) and below TIE_DG (J/mol), that set's state again (a tie at rounding level); within TIE_X
+# and below TIE_DG_FAR, the other side of a miscibility gap that has just closed at its critical point. A phase that
+# really appears there gains driving force quickly and is found at the next step
 TIE_X_NEAR = 1e-3
 TIE_DG = 1.0
 TIE_X = 0.03
@@ -106,21 +109,28 @@ _EQUIV = None   # set per solve: (phases, state variables, index of T) for _same
 def _same_state(sets, ys, xs, a, b):
     """Whether composition sets a and b ended in the same state: of one phase at the same site fractions, or of two
     descriptions of a phase (different names, e.g. an ordered model in its disordered state and the disordered
-    model) at the same composition with equal energies also at another temperature (two different phases at one
-    composition, e.g. solid and liquid at a melting point, differ there)."""
+    model) at the same composition (see _equivalent_description)."""
     if sets[a].phase_record.phase_name == sets[b].phase_record.phase_name:
         return np.allclose(ys[a], ys[b], atol=10 * COMP_DIFFERENCE_TOL)
     if np.max(np.abs(np.asarray(xs[a]) - np.asarray(xs[b]))) >= 10 * COMP_DIFFERENCE_TOL or _EQUIV is None:
         return False
     phases, sv, it = _EQUIV
-    pa, pb = phases[sets[a].phase_record.phase_name], phases[sets[b].phase_record.phase_name]
-    other = sv.copy(); other[it] += 100.0
+    return _equivalent_description(phases[sets[a].phase_record.phase_name], ys[a],
+                                   phases[sets[b].phase_record.phase_name], ys[b], sv, it)
+
+
+def _equivalent_description(pa, ya, pb, yb, sv, t_index):
+    """Whether phase pa at site fractions ya and phase pb at yb (same composition) are one state in two descriptions:
+    equal energies also 100 K away (two different phases at one composition differ there by their entropy
+    difference times 100 K). The phases' state variables are restored."""
+    if t_index is None:
+        return False
+    other = np.array(sv, dtype=float); other[t_index] += 100.0
     try:
         pa.core.set_statevars(other); pb.core.set_statevars(other)
-        ga = pa.core.evaluate(ys[a])[0]; gb = pb.core.evaluate(ys[b])[0]
+        ga = pa.core.evaluate(ya)[0]; gb = pb.core.evaluate(yb)[0]
     finally:
         pa.core.set_statevars(sv); pb.core.set_statevars(sv)
-    # (J/mol: two descriptions of one phase differ only by a slight ordering there; two phases by tens of J/mol)
     return abs(ga - gb) < 5.0
 
 
@@ -232,11 +242,12 @@ class CGSolver(SolverBase):
         try:
             with SOLVE_LOCK:
                 return self._solve_with_swap(composition_sets, conditions, saved)
-        except CGCapabilityError:
+        except CGCapabilityError as err:
             composition_sets[:] = [cs for cs, _, _ in saved]
             ns = len(saved[0][0].phase_record.state_variables)
             for cs, dof, NP in saved:
                 cs.update(dof[ns:], NP, dof[:ns])
+            _cgmode.fallback_or_raise(err)
             return Solver(verbose=self.verbose, remove_metastable=self.remove_metastable,
                           **self.options).solve(composition_sets, conditions)
 
@@ -284,7 +295,7 @@ class CGSolver(SolverBase):
         global _EQUIV
         R, b, mu_fixed, fixed = _condition_rows(conds, elements, np.asarray(prf.molar_masses, dtype=float))
         K = R.shape[0]
-        params = np.asarray(prf.param_values, dtype=float)
+        params = np.array(prf.param_values, dtype=float)
         for ph in phases.values():
             E, e, pinned = _local_constraints(ph, conds, elements)
             ph.core.set_state(sv, params)
@@ -395,6 +406,7 @@ class CGSolver(SolverBase):
             for a in active:
                 sets[a].update(ys[a], max(n[a], 0.0) if not is_fixed[a] else sets[a].NP, sv)
             mu = _initial_potentials([sets[active[0]]], phases, mu_fixed, fixed)
+        _raise_load_errors(phases.values())
         # write back
         for a, cs in enumerate(sets):
             cs.update(ys[a], max(n[a], 0.0) if not is_fixed[a] else cs.NP, sv)
@@ -431,7 +443,14 @@ def _global_min_candidate(point, system_info, tol):
         return None
     ns = len(prf.state_variables)
     sv = np.array(stable[0].dof[:ns], dtype=float)
-    params = np.asarray(prf.param_values, dtype=float)
+    params = np.array(prf.param_values, dtype=float)
+    by_name = {ph.name: ph for ph in phases}
+    sv_names = [str(s) for s in prf.state_variables]
+    t_index = sv_names.index('T') if 'T' in sv_names else None
+    for ph in phases:
+        ph.core.set_state(sv, params)
+        ph.core.set_local_constraints(np.zeros((0, ph.D)), np.zeros(0))
+        ph.core.set_pinned(np.zeros(ph.D, dtype=np.int32))
     mu = np.asarray(point.chemical_potentials, dtype=float).reshape(-1)
     # overall composition from the stable sets
     z = np.zeros(len(elements)); total = 0.0
@@ -442,9 +461,6 @@ def _global_min_candidate(point, system_info, tol):
     best = None
     stable_x = [np.asarray(cs.X, dtype=float) for cs in stable]
     for ph in phases:
-        ph.core.set_state(sv, params)
-        ph.core.set_local_constraints(np.zeros((0, ph.D)), np.zeros(0))
-        ph.core.set_pinned(np.zeros(ph.D, dtype=np.int32))
         starts = [np.array(cs.dof[ns:], dtype=float) for cs in stable if cs.phase_record.phase_name == ph.name]
         starts += ph.seeds(z, elements, rng, state=(tuple(sv), tuple(params), ()))
         for y0 in starts:
@@ -452,13 +468,18 @@ def _global_min_candidate(point, system_info, tol):
             if not np.isfinite(G):
                 continue
             dG = -tpd
-            near = min((np.max(np.abs(np.asarray(x) - xs)) for xs in stable_x), default=np.inf)
-            if (near < TIE_X_NEAR and dG < TIE_DG) or (near < TIE_X and dG < TIE_DG_FAR):
-                # a state already present in another description of equal energy (e.g. an ordered model in its
-                # disordered state and the disordered model), not a new phase
+            k = int(np.argmin([np.max(np.abs(np.asarray(x) - xs)) for xs in stable_x]))
+            near = float(np.max(np.abs(np.asarray(x) - stable_x[k])))
+            if ((near < TIE_X_NEAR and dG < TIE_DG) or (near < TIE_X and dG < TIE_DG_FAR)) and (
+                    stable[k].phase_record.phase_name == ph.name or _equivalent_description(
+                        by_name[stable[k].phase_record.phase_name], np.array(stable[k].dof[ns:], dtype=float),
+                        ph, y, sv, t_index)):
+                # that composition set's state again, possibly in another description of equal energy (e.g. an
+                # ordered model in its disordered state and the disordered model), not a new phase
                 continue
             if best is None or dG > best[1]:
                 best = (ph.name, dG, y)
+    _raise_load_errors(phases)
     if best is None or best[1] < tol:
         return None
     cs = CompositionSet(prf[best[0]])

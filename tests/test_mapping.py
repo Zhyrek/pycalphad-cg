@@ -2,6 +2,7 @@
 import matplotlib
 import numpy as np
 import pycalphad
+import pytest
 
 import pycalphad_cg as pyc
 from conftest import load_database
@@ -100,3 +101,62 @@ def test_flat_energy_without_mixing_entropy_is_converged_precisely():
     wks = pyc.Workspace(dbf, ['A', 'B'], ['S', 'M'], {v.N: 1, v.P: 1e5, v.T: 10, v.X('A'): 0.5}, models=models)
     x_s, x_m = wks.get('X(S,A)', 'X(M,A)')
     np.testing.assert_allclose([float(x_s), float(x_m)], [0.1 - 0.03125, 0.9 - 0.03125], atol=1e-12)
+
+
+def test_new_phase_search_finds_a_phase_at_the_same_composition():
+    "A unary just above its melting point: the liquid (same composition, small driving force) is found."
+    from pycalphad import Workspace, variables as v
+    from pycalphad.core.composition_set import CompositionSet
+    from pycalphad.mapping.primitives import Point
+    from scipy.optimize import brentq
+    from pycalphad_cg.local import global_min_candidate
+    dbf = load_database('alfe.tdb')
+    conds = {v.N: 1, v.P: 101325, v.T: 934}
+    wks = Workspace(dbf, ['AL', 'VA'], ['FCC_A1', 'LIQUID'], conds)
+    prf = wks.phase_record_factory
+
+    def state(T):
+        return np.array([float(T) if s == v.T else float(conds[s]) for s in prf.state_variables])
+
+    def energy(name, T):
+        cs = CompositionSet(prf[name])
+        cs.update(np.ones(cs.phase_record.phase_dof), 1.0, state(T))
+        return cs.energy
+    T = brentq(lambda T: energy('LIQUID', T) - energy('FCC_A1', T), 900, 1000) + 0.05
+    conds[v.T] = T
+    solid = CompositionSet(prf['FCC_A1'])
+    solid.update(np.ones(solid.phase_record.phase_dof), 1.0, state(T))
+    point = Point(conds, np.array([solid.energy]), [], [solid])
+    info = {'dbf': dbf, 'comps': ['AL', 'VA'], 'phases': ['FCC_A1', 'LIQUID'], 'models': wks.models.unwrap(),
+            'phase_records': prf}
+    found = global_min_candidate(point, info, tol=1e-5)
+    assert found is not None and found[0].phase_record.phase_name == 'LIQUID'
+    np.testing.assert_allclose(found[1], solid.energy - energy('LIQUID', T), rtol=1e-6)
+
+
+def test_fallback_off_raises_in_mapping():
+    "With fallback off, a problem column generation does not handle raises, although pycalphad's mapping catches it."
+    import pycalphad.mapping.zpf_equilibrium as zeq
+    from pycalphad import Database, Model, variables as v
+    from pycalphad.mapping.starting_points import point_from_equilibrium
+
+    class NoTemperature(Model):
+        contributions = [('custom', 'custom_gibbs')]
+
+        def custom_gibbs(self, dbe):
+            return 1000 * (v.Y(self.phase_name, 0, 'AL') ** 2 + v.Y(self.phase_name, 0, 'FE') ** 2)
+    dbf = Database('''
+    ELEMENT AL FCC_A1 26.98 0 0 !
+    ELEMENT FE BCC_A2 55.85 0 0 !
+    PHASE LIQUID % 1 1 !
+    CONSTITUENT LIQUID :AL,FE: !
+    ''')
+    conds = {v.P: 101325, v.N: 1, v.X('AL'): 0.3}
+    models = {'LIQUID': NoTemperature(dbf, ['AL', 'FE'], 'LIQUID')}
+    point = point_from_equilibrium(dbf, ['AL', 'FE'], ['LIQUID'], dict(conds), models=models)
+    with pytest.raises(pyc.CGCapabilityError):
+        with pyc.cg_mode(fallback=False):
+            assert zeq.update_equilibrium_with_new_conditions(point, {**conds, v.X('AL'): 0.31}) is None
+    with pytest.warns(UserWarning, match='column generation does not handle'):
+        with pyc.cg_mode(fallback=True):
+            assert zeq.update_equilibrium_with_new_conditions(point, {**conds, v.X('AL'): 0.31}) is not None

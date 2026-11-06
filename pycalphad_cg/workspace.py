@@ -17,7 +17,7 @@ from pycalphad.core.workspace import Workspace as _PycalphadWorkspace
 
 from pycalphad_cg._cgmode import cg_mode
 from pycalphad_cg._options import options
-from pycalphad_cg.solve import solve_workspace, CGCapabilityError
+from pycalphad_cg.solve import solve_workspace, CGCapabilityError, SOLVE_LOCK
 
 __all__ = ['Workspace', 'CGWorkspace', 'equilibrium']
 
@@ -47,9 +47,10 @@ class Workspace(_PycalphadWorkspace):
         fallback = options.fallback if self.cg_fallback is None else self.cg_fallback
         try:
             self._check_supported()
-            self.phase_record_factory.update_parameters(self.parameters.unwrap())
             threads = options.threads if self.cg_threads is None else self.cg_threads
-            return solve_workspace(self, threads=threads)
+            with SOLVE_LOCK:   # (the phase-record factory, with its parameters, can be shared between workspaces)
+                self.phase_record_factory.update_parameters(self.parameters.unwrap())
+                return solve_workspace(self, threads=threads)
         except CGCapabilityError as err:
             if not fallback:
                 raise
@@ -62,6 +63,7 @@ class Workspace(_PycalphadWorkspace):
         errors."""
         from pycalphad.core.errors import ConditionError
         from pycalphad.core.utils import filter_phases, unpack_species
+        from pycalphad.property_framework.units import as_quantity
         comps = sorted(unpack_species(self.database, self.components))
         possible = filter_phases(self.database, comps)
         if len(possible) == 0:
@@ -69,7 +71,8 @@ class Workspace(_PycalphadWorkspace):
         if len(filter_phases(self.database, comps, self.phases)) == 0:
             raise ConditionError(f'None of the passed phases ({self.phases}) are active. List of possible phases: '
                                  f'{possible}.')
-        conds = {str(key): value for key, value in self.conditions.items()}
+        conds = {str(key): as_quantity(key, value).to(key.implementation_units).magnitude
+                 for key, value in self.conditions.items()}
         if 'N' in conds and np.any(np.asarray(conds['N']) != 1):
             raise ConditionError(f'N!=1 is not yet supported, got N={conds["N"]}')
         missing = sorted({str(sv) for sv in self.phase_record_factory.state_variables} - set(conds) - {'N'})
@@ -80,13 +83,25 @@ class Workspace(_PycalphadWorkspace):
     def _check_supported(self):
         if self.calc_opts and set(self.calc_opts) - {'pdens'}:
             raise CGCapabilityError(f'calc_opts {sorted(set(self.calc_opts) - {"pdens"})}')
-        if type(self.solver) is not Solver:
-            raise CGCapabilityError('a custom solver object (pycalphad refines its own starting points with it)')
+        if not _is_default_solver(self.solver):
+            raise CGCapabilityError('a custom or configured solver object (pycalphad refines its own starting points '
+                                    'with it)')
         if type(self.phase_record_factory) is not PhaseRecordFactory:
             raise CGCapabilityError('custom phase records')
 
 
 CGWorkspace = Workspace
+
+
+def _is_default_solver(solver):
+    """Whether `solver` is pycalphad's Solver as Workspace creates it by default (any verbosity): column generation
+    replaces it. A subclass, or a Solver with other settings (remove_metastable=False, options such as
+    max_iterations), is the caller's and is honoured by falling back to pycalphad's solver."""
+    if type(solver) is not Solver:
+        return False
+    settings = {k: val for k, val in vars(solver).items() if k != 'verbose'}
+    return (settings.pop('remove_metastable', True) is True and not settings.pop('options', None)
+            and not settings)
 
 
 def _check_degrees_of_freedom(conditions, phase_record_factory):

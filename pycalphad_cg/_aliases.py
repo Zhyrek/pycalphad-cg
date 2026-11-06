@@ -20,12 +20,17 @@ TARGET = 'pycalphad'
 class _AliasLoader(importlib.abc.Loader):
     def __init__(self, target):
         self.target = target
+        self.original_spec = None
 
     def create_module(self, spec):
-        return importlib.import_module(self.target)
+        module = importlib.import_module(self.target)
+        self.original_spec = module.__spec__
+        return module
 
     def exec_module(self, module):
-        pass   # (pycalphad's module is already executed)
+        # pycalphad's module is already executed. The import system has just set its __spec__ to the alias's; put
+        # pycalphad's own back (its loader and package path, which importlib.resources and reloading use).
+        module.__spec__ = self.original_spec
 
 
 class _AliasFinder(importlib.abc.MetaPathFinder):
