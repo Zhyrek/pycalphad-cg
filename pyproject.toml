@@ -9,7 +9,7 @@ description = "pycalphad with a column-generation equilibrium solver: a drop-in 
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
-authors = [{name = "Scott Peters"}]
+authors = [{name = "Zhyrek"}]
 requires-python = ">=3.11"
 dependencies = ["pycalphad>=0.11.2", "numpy>=1.23", "scipy>=1.8"]
 classifiers = [
