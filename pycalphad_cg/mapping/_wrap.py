@@ -1,5 +1,6 @@
 """Column-generation versions of pycalphad's mapping strategies and compatibility functions."""
 import inspect
+import warnings
 
 from pycalphad_cg._cgmode import run_in_cg_mode
 
@@ -36,16 +37,39 @@ def cg_strategy(cls):
     return new
 
 
-def all_cg_strategies():
-    """The column-generation versions of all of pycalphad's strategy classes (by name)."""
+def is_deprecated(cls):
+    """Whether pycalphad marks the class deprecated (``warnings.deprecated``, e.g. BinaryStrategy in pycalphad 0.12),
+    which warns when the class is subclassed, not only when it is used."""
+    return getattr(cls, '__deprecated__', None) is not None
+
+
+def cg_strategy_quietly(cls):
+    """cg_strategy without the deprecation warning that subclassing a deprecated class gives: the column-generation
+    version is built on request, and using it still warns, as pycalphad's class does."""
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', DeprecationWarning)
+        return cg_strategy(cls)
+
+
+def all_cg_strategies(include_deprecated=False):
+    """The column-generation versions of pycalphad's strategy classes (by name); deprecated ones only on request
+    (importing this package must not warn: pycalphad imports it as a plugin)."""
     import pycalphad.mapping as mapping
     import pycalphad.mapping.strategy as strategy
     out = {}
     for module in (mapping, strategy):
         for name, value in vars(module).items():
-            if not name.startswith('_') and is_strategy_class(value):
+            if not name.startswith('_') and is_strategy_class(value) and (include_deprecated or not is_deprecated(value)):
                 out[name] = cg_strategy(value)
     return out
+
+
+def deprecated_strategy(module, name):
+    """The column-generation version of the deprecated strategy class ``module.name`` of pycalphad, or None."""
+    value = getattr(module, name, None)
+    if is_strategy_class(value) and is_deprecated(value):
+        return cg_strategy_quietly(value)
+    return None
 
 
 def is_strategy_class(obj):
@@ -58,4 +82,4 @@ def cg_function(function):
     return run_in_cg_mode(function)
 
 
-__all__ = ['cg_strategy', 'cg_function', 'is_strategy_class', 'all_cg_strategies']
+__all__ = ['cg_strategy', 'cg_function', 'is_strategy_class', 'all_cg_strategies', 'deprecated_strategy']

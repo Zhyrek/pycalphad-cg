@@ -14,9 +14,14 @@ def _conditions(element):
     return {pyc.v.T: (1000, 2000, 25), pyc.v.X(element): (0, 1, 0.025), pyc.v.P: 101325, pyc.v.N: 1}
 
 
+def _tieline_strategy(module):
+    "TielineStrategy (pycalphad >= 0.12), else BinaryStrategy"
+    return getattr(module, 'TielineStrategy', None) or module.BinaryStrategy
+
+
 def test_binary_strategy_uses_column_generation(cg_calls):
     dbf = load_database('alni_dupin_2001.tdb')
-    strategy = pyc.mapping.BinaryStrategy(dbf, ['AL', 'NI', 'VA'], list(dbf.phases), _conditions('AL'))
+    strategy = _tieline_strategy(pyc.mapping)(dbf, ['AL', 'NI', 'VA'], list(dbf.phases), _conditions('AL'))
     strategy.do_map()
     assert cg_calls['workspace'] > 0 and cg_calls['local'] > 0 and cg_calls['global_min'] > 0
     assert len(strategy.zpf_lines) > 0
@@ -24,7 +29,7 @@ def test_binary_strategy_uses_column_generation(cg_calls):
     tielines = {tuple(sorted(line.stable_phases)) for line in strategy.zpf_lines}
     assert any('FCC_L12' in phases for phases in tielines)
     calls = dict(cg_calls)
-    plain = pycalphad.mapping.BinaryStrategy(dbf, ['AL', 'NI', 'VA'], list(dbf.phases), _conditions('AL'))
+    plain = _tieline_strategy(pycalphad.mapping)(dbf, ['AL', 'NI', 'VA'], list(dbf.phases), _conditions('AL'))
     plain.do_map()
     assert cg_calls == calls   # pycalphad's own strategy is unaffected
 
@@ -160,3 +165,31 @@ def test_fallback_off_raises_in_mapping():
     with pytest.warns(UserWarning, match='column generation does not handle'):
         with pyc.cg_mode(fallback=True):
             assert zeq.update_equilibrium_with_new_conditions(point, {**conds, v.X('AL'): 0.31}) is not None
+
+
+def test_narrow_field_in_a_step_and_starting_points_for_every_field():
+    """Au-Cu at 300 K (pycalphad's test_automatic_starting_points_for_every_merged_field, pycalphad >= 0.12): column
+    generation resolves the narrow Au3Cu field (x(CU) = 0.237-0.280) in the step map, every two-phase field gets
+    starting points in both directions, and the Au-rich fcc+Au3Cu field is mapped."""
+    if not hasattr(pycalphad.mapping, 'TielineStrategy'):
+        pytest.skip('TielineStrategy (pycalphad >= 0.12)')
+    try:
+        dbf = load_database('AuCu-98Sun-LB.tdb')
+    except FileNotFoundError:
+        pytest.skip('AuCu-98Sun-LB.tdb (pycalphad >= 0.12)')
+    conds = {pyc.v.P: 101325, pyc.v.N: 1, pyc.v.T: (300, 540, 20), pyc.v.X('CU'): (0, 0.5, 0.05)}
+    strategy = pyc.mapping.TielineStrategy(dbf, ['AU', 'CU', 'VA'], ['FCC_4SL'], conds)
+    step_conds = {pyc.v.P: 101325, pyc.v.N: 1, pyc.v.T: 300, pyc.v.X('CU'): (0.2, 0.52, 0.05)}
+    step = pyc.mapping.StepStrategy(dbf, ['AU', 'CU', 'VA'], ['FCC_4SL'], step_conds, models=strategy.models,
+                                    phase_record_factory=strategy.phase_records)
+    step.do_map()
+    assert any(len(line.stable_phases_with_multiplicity) == 1
+               and np.min(line.get_var_list(pyc.v.X('CU'))) < 0.24 < 0.275 < np.max(line.get_var_list(pyc.v.X('CU')))
+               for line in step.zpf_lines)
+    strategy.add_starting_points_from_step(step)
+    starting_points = sorted((round(min(cs.X[1] for cs in node.stable_composition_sets), 3), node.axis_direction.value)
+                             for node in strategy.node_queue.nodes)
+    assert starting_points == [(0.078, -1), (0.078, 1), (0.28, -1), (0.28, 1)]
+    strategy.do_map()
+    assert any(np.min(line.get_var_list(pyc.v.X('CU'))) < 0.15 and np.max(line.get_var_list(pyc.v.X('CU'))) > 0.20
+               for line in strategy.zpf_lines)

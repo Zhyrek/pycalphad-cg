@@ -14,7 +14,7 @@ ax = binplot(dbf, ['AL', 'FE', 'VA'], list(dbf.phases), conds)
 ```
 
 Everything that computes equilibria uses column generation: `equilibrium`, `Workspace`, the mapping strategies
-(`pycalphad_cg.mapping.BinaryStrategy` etc.), `binplot` and `ternplot`. Everything else is pycalphad's own object
+(`pycalphad_cg.mapping.TielineStrategy` etc.), `binplot` and `ternplot`. Everything else is pycalphad's own object
 (`pycalphad_cg.Database is pycalphad.Database`), and so are pycalphad's modules: `pycalphad_cg.X` is `pycalphad.X`
 for every module this package does not replace, so `import pycalphad_cg.variables as v` or
 `from pycalphad_cg.plot.utils import phase_legend` work too. (The import name has an underscore: Python names
@@ -34,7 +34,7 @@ From this repository (needs a C++ compiler):
 pip install git+https://github.com/Zhyrek/pycalphad-cg
 ```
 
-It works with pycalphad 0.11.2 (the current release) and pycalphad's develop branch. The compiled core uses no C
+It works with pycalphad 0.11.2 and 0.12.0 and with pycalphad's develop branch. The compiled core uses no C
 declarations from pycalphad (it reads pycalphad's compiled energy functions through its Python API, the same way
 pycalphad itself does), so one build works with any pycalphad version that keeps that API.
 
@@ -100,9 +100,24 @@ with every test inside `cg_mode()` and `pycalphad.Workspace` replaced:
 | pycalphad | plain | with column generation | column-generation solves | fallbacks |
 |---|---|---|---|---|
 | 0.11.2 | 309 passed, 2 skipped, 1 xfailed | 309 passed, 2 skipped, 1 xfailed | 173 | 5 |
-| develop (0cbc613c0) | 395 passed, 2 skipped, 1 xfailed, 1 xpassed | 395 passed, 2 skipped, 1 xfailed, 1 xpassed | 204 | 6 |
+| 0.12.0 | 414 passed, 2 skipped, 2 xfailed, 1 xpassed | 414 passed, 2 skipped, 2 xfailed, 1 xpassed | 260 | 6 |
+| develop (a7ea88fac) | 414 passed, 2 skipped, 2 xfailed, 1 xpassed | 414 passed, 2 skipped, 2 xfailed, 1 xpassed | 260 | 6 |
 
 The fallbacks are the tests that pass their own or a configured solver object (see Limits). (Apple M4, Python 3.12, SymEngine 0.14.1.)
+
+Two of pycalphad's 0.12 mapping tests come out differently, which the plugin records:
+
+- `test_zpf_line_from_saddle_point_configuration_reaches_invariant` (Ni-Pt), marked by pycalphad as an expected
+  failure of its solver (pycalphad#746: L1<sub>2</sub> left on a saddle point), passes with column generation and is
+  run as an ordinary test.
+- `test_automatic_starting_points_for_every_merged_field` (Au-Cu) assumes that a step map at 300 K steps over the
+  narrow Au<sub>3</sub>Cu field; column generation resolves that field instead. It is marked as an expected failure,
+  and what it checks (a starting point in each direction for every field, the Au-rich field mapped) is a test of
+  this package.
+
+pycalphad#762 (Al-Ni with a four-sublattice FCC, `AlNi-22Yan.tdb` attached to the issue): both of its reference tests,
+where pycalphad misses L1<sub>2</sub> below the invariants, pass with `pycalphad_cg.Workspace` in place of
+`Workspace`.
 
 **This package's tests** (`pytest tests`) compare with pycalphad on binaries and ternaries from pycalphad's test
 databases:
@@ -165,9 +180,9 @@ pycalphad's; it is never above pycalphad's by more than 0.0014 J/mol.
 - **Properties that solve their own sub-problems** (`DormantPhase`, `T0`, driving forces through
   `pycalphad.property_framework`) use pycalphad's Newton solver on the composition sets the equilibrium returned,
   as in pycalphad.
-- **Deep module paths** give pycalphad's objects: `pycalphad_cg.mapping.BinaryStrategy` and
-  `pycalphad_cg.mapping.strategy.BinaryStrategy` use column generation, but
-  `pycalphad_cg.mapping.strategy.binary_strategy.BinaryStrategy` is pycalphad's own class.
+- **Deep module paths** give pycalphad's objects: `pycalphad_cg.mapping.TielineStrategy` and
+  `pycalphad_cg.mapping.strategy.TielineStrategy` use column generation, but
+  `pycalphad_cg.mapping.strategy.tieline_strategy.TielineStrategy` is pycalphad's own class.
 - **One calculation at a time per process.** The compiled phases are cached across calls and shared, so concurrent
   calls from several threads run one after the other (each uses its own worker threads).
 

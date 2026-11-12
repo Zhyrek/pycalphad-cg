@@ -19,6 +19,34 @@ import pycalphad_cg.workspace
 
 _counts = {'solves': 0}
 _fallbacks = []
+_passes_with_cg = []
+
+# pycalphad tests whose premise is a behaviour of pycalphad's own solver that column generation does not share. Each
+# is marked xfail here; what the test is for is checked in this package's tests.
+KNOWN_DIFFERENCES = {
+    'test_automatic_starting_points_for_every_merged_field':
+        "its premise is that a step map at 300 K steps over the narrow Au3Cu field (two fields merge into one step "
+        "line); column generation resolves that field instead. The starting points and the mapped Au-rich field are "
+        "checked in tests/test_mapping.py",
+}
+
+
+# pycalphad tests marked as expected failures of pycalphad's solver that column generation passes: run as ordinary
+# tests here (an unexpected pass of a strict xfail would be reported as a failure)
+PASSES_WITH_CG = {
+    'test_zpf_line_from_saddle_point_configuration_reaches_invariant',   # (gh-746: L12 left on a saddle point)
+}
+
+
+def pytest_collection_modifyitems(config, items):
+    for item in items:
+        name = getattr(item, 'originalname', None) or item.name.split('[')[0]
+        reason = KNOWN_DIFFERENCES.get(name)
+        if reason is not None:
+            item.add_marker(pytest.mark.xfail(reason=reason, strict=False))
+        if name in PASSES_WITH_CG:
+            item.own_markers[:] = [mark for mark in item.own_markers if mark.name != 'xfail']
+            _passes_with_cg.append(item.nodeid)
 
 
 class _RecordingWarnings:
@@ -56,3 +84,5 @@ def pytest_terminal_summary(terminalreporter):
                                 f'pycalphad\'s solver')
     for reason in sorted(set(_fallbacks)):
         terminalreporter.write_line(f'    {_fallbacks.count(reason)} x {reason}')
+    for nodeid in _passes_with_cg:
+        terminalreporter.write_line(f'    run as an ordinary test (an expected failure of pycalphad\'s solver): {nodeid}')

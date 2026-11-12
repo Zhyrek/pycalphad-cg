@@ -3,6 +3,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import warnings
 
 import numpy as np
 import pycalphad
@@ -27,9 +28,11 @@ def test_column_generation_entry_points():
     assert pyc.CGWorkspace is pyc.Workspace
     assert pyc.equilibrium is not pycalphad.equilibrium
     assert pyc.binplot is not pycalphad.binplot and pyc.ternplot is not pycalphad.ternplot
-    for name in ['BinaryStrategy', 'TernaryStrategy', 'IsoplethStrategy', 'StepStrategy']:
+    for name in ['TielineStrategy', 'BinaryStrategy', 'TernaryStrategy', 'IsoplethStrategy', 'StepStrategy']:
         if hasattr(pycalphad.mapping, name):
-            cg_class = getattr(pyc.mapping, name)
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore', DeprecationWarning)   # (BinaryStrategy, TernaryStrategy in 0.12)
+                cg_class = getattr(pyc.mapping, name)
             assert cg_class.__mro__[1] is getattr(pycalphad.mapping, name)
             assert getattr(pyc.mapping.strategy, name) is cg_class
 
@@ -138,3 +141,11 @@ def test_strategy_classes_keep_their_hierarchy_and_pickle():
             assert issubclass(cls, pycalphad.mapping.strategy.MapStrategy)
             assert pickle.loads(pickle.dumps(cls)) is cls
     assert pickle.loads(pickle.dumps(pyc.mapping.strategy.MapStrategy)) is pyc.mapping.strategy.MapStrategy
+
+
+def test_import_does_not_warn():
+    "pycalphad imports this package as a plugin: importing it must not warn (e.g. about deprecated strategies)."
+    code = 'import pycalphad, pycalphad_cg, pycalphad_cg.mapping, pycalphad_cg.mapping.strategy; print("ok")'
+    out = subprocess.run([sys.executable, '-W', 'error', '-c', code], capture_output=True, text=True,
+                         cwd=tempfile.gettempdir())
+    assert out.returncode == 0 and out.stdout.strip() == 'ok', out.stderr

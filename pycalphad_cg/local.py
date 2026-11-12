@@ -206,21 +206,23 @@ def _composition_step(sets, conds, elements):
 
 
 def _jumped(sets, ys0, ys, xs0, xs, active, step):
-    """Whether an active composition set changed discontinuously (see JUMP and JUMP_X). A set is compared with its
-    own starting state, or with that of another set of its phase that has left the solve (a miscibility gap
-    closing: the two sets became one, which may continue from either side), whichever is nearer."""
+    """Whether an active composition set changed discontinuously (see JUMP and JUMP_X): from its own starting state
+    and also from that of every other set of its phase that has left the solve (a miscibility gap closing: the two
+    sets became one, which may continue from either side). A set that is continuous with any of these is not a
+    jump (e.g. a disordered set that takes over from an ordered one at the same composition)."""
     gone = [a for a in range(len(sets)) if a not in active]
     for k, a in enumerate(active):
         refs = [a] + [g for g in gone if sets[g].phase_record.phase_name == sets[a].phase_record.phase_name]
         x = np.asarray(xs[k])
-        ref = min(refs, key=lambda r: float(np.max(np.abs(x - xs0[r]))))
-        dy = float(np.max(np.abs(ys[a] - ys0[ref]))) if len(ys[a]) else 0.0
-        dx = float(np.max(np.abs(x - xs0[ref])))
-        if dy > JUMP and dy > JUMP_RATIO * dx:
-            return True
-        if dx > JUMP_X and dx > JUMP_X_RATIO * step:
+        if all(_jumped_from(ys0[r], xs0[r], ys[a], x, step) for r in refs):
             return True
     return False
+
+
+def _jumped_from(y0, x0, y, x, step):
+    dy = float(np.max(np.abs(y - y0))) if len(y) else 0.0
+    dx = float(np.max(np.abs(x - x0)))
+    return (dy > JUMP and dy > JUMP_RATIO * dx) or (dx > JUMP_X and dx > JUMP_X_RATIO * step)
 
 
 class CGSolver(SolverBase):
@@ -236,20 +238,38 @@ class CGSolver(SolverBase):
     def solve(self, composition_sets, conditions):
         """Newton from the composition sets as they are; if two sets of one phase collapsed onto each other (see
         _collapsed), once more with their starting site fractions exchanged: stepping a two-phase line over a
-        critical point, the sets change sides, and each then starts on the side it ends on. Problems column
-        generation does not handle go to pycalphad's Solver."""
+        critical point, the sets change sides, and each then starts on the side it ends on.
+
+        Problems column generation does not handle go to pycalphad's Solver (see _cgmode.fallback_or_raise). So do
+        solves where Newton reaches its iteration limit, silently: the conditions may have no solution with these
+        composition sets (e.g. a liquid and a compound past a congruent melting point), and pycalphad's mapping
+        checks are written around what pycalphad's Solver returns there (e.g. a zero-width tie-line, which ends the
+        line). The solves this solver rejects on purpose (a constitution jump, sets collapsing onto each other) are
+        not passed on."""
         saved = [(cs, np.array(cs.dof, dtype=float), float(cs.NP)) for cs in composition_sets]
         try:
             with SOLVE_LOCK:
-                return self._solve_with_swap(composition_sets, conditions, saved)
+                result = self._solve_with_swap(composition_sets, conditions, saved)
+            if result.converged or self._why != 'iteration limit':
+                return result
         except CGCapabilityError as err:
-            composition_sets[:] = [cs for cs, _, _ in saved]
+            self._restore(composition_sets, saved)
+            _cgmode.fallback_or_raise(err)
+            return self._pycalphad_solve(composition_sets, conditions)
+        self._restore(composition_sets, saved)
+        return self._pycalphad_solve(composition_sets, conditions)
+
+    @staticmethod
+    def _restore(composition_sets, saved):
+        composition_sets[:] = [cs for cs, _, _ in saved]
+        if saved:
             ns = len(saved[0][0].phase_record.state_variables)
             for cs, dof, NP in saved:
                 cs.update(dof[ns:], NP, dof[:ns])
-            _cgmode.fallback_or_raise(err)
-            return Solver(verbose=self.verbose, remove_metastable=self.remove_metastable,
-                          **self.options).solve(composition_sets, conditions)
+
+    def _pycalphad_solve(self, composition_sets, conditions):
+        return Solver(verbose=self.verbose, remove_metastable=self.remove_metastable,
+                      **self.options).solve(composition_sets, conditions)
 
     def _solve_with_swap(self, composition_sets, conditions, saved):
         result = self._solve(composition_sets, conditions)
