@@ -20,7 +20,7 @@ import threading
 
 import numpy as np
 from libc.math cimport exp, log, fabs, sqrt, INFINITY, NAN, isfinite
-from libc.string cimport memcpy
+from libc.string cimport memcpy, memcmp
 from libc.stdlib cimport malloc, free
 from libc.stdint cimport int64_t
 from scipy.linalg.cython_lapack cimport dsyev, dgetrf, dgetrs, dpotrf, dpotrs, dgesv, dgelss
@@ -87,6 +87,7 @@ cdef class CPhase:
     cdef void** d_mg
     cdef void** d_mh
     cdef double[::1] inp, graw, hraw, gsv, mval, mgraw, mhraw, gM, hM, gm
+    cdef int eval_level                 # cached derivatives at inp: 0 invalid, 1 energy, 2 gradient, 3 Hessian
     cdef double G_fu, Mtot
     cdef public double[::1] out1          # [GM] per mole of atoms at the last eval1
     cdef double[::1] y, z, zt, yt, gz, gzt, gy, gyt, gl, d, Hz, Hy, M, w, work, V, coef, bt, sc, Hs, Bm, Wm, xs
@@ -155,6 +156,7 @@ cdef class CPhase:
         EE = np.array(E, dtype=float).reshape(-1, D)
         self.ne_fixed = EE.shape[0]
         self.set_constraints(EE, np.asarray(e, dtype=float).reshape(-1))
+        self.eval_level = 0
         self.inp = np.zeros(n + self.npar); self.graw = np.zeros(n); self.hraw = np.zeros(n * n); self.gsv = np.zeros(self.ns)
         self.mval = np.zeros(C); self.mgraw = np.zeros(C * n); self.mhraw = np.zeros(C * n * n)
         self.gm = np.zeros(C * D); self.gM = np.zeros(D); self.hM = np.zeros(D * D)
@@ -268,6 +270,7 @@ cdef class CPhase:
     def set_state(self, statevars, parameters):
         """State-variable values (in the PhaseRecord's order) and parameter values for the following evaluations."""
         cdef int k
+        self.eval_level = 0
         sv = np.asarray(statevars, dtype=float)
         for k in range(self.ns): self.inp[k] = sv[k]
         par = np.asarray(parameters, dtype=float)
@@ -304,28 +307,39 @@ cdef class CPhase:
         return self.asum[j] if self.linear else self.gM[j]
 
     cdef void eval0(self, double* y) noexcept nogil:
-        """Energy and formula moles only; GM per mole of atoms in out1[0]."""
+        """Energy and formula moles only; GM per mole of atoms in out1[0].
+
+        Cache only identical inputs: pricing often asks for the gradient, then the Hessian and final energy at
+        the same site fractions. State/parameter setters and x_of_y invalidate the cache. The cached derivatives
+        are of G and formula moles, independent of the chemical potentials and constraints.
+        """
+        if self.eval_level and memcmp(&self.inp[self.ns], y, self.D * sizeof(double)) == 0:
+            return
+        self.eval_level = 0
         memcpy(&self.inp[self.ns], y, self.D * sizeof(double))
         self.p_G(&self.G_fu, &self.inp[0], self.d_G)
         self.moles(y)
         self.out1[0] = self.G_fu / self.Mtot
+        self.eval_level = 1
 
     cdef void eval1(self, double* y) noexcept nogil:
         """Energy and its gradient (graw), formula moles (moles()); GM per mole of atoms in out1[0]."""
-        cdef int D = self.D, ns = self.ns, j
+        cdef int ns = self.ns, j
+        self.eval0(y)
+        if self.eval_level >= 2:
+            return
         self.evals1 += 1
         self.ensure_derivatives()
-        memcpy(&self.inp[ns], y, D * sizeof(double))
-        self.p_G(&self.G_fu, &self.inp[0], self.d_G)
         self.p_grad(&self.graw[0], &self.inp[0], self.d_grad)
-        self.moles(y)
-        self.out1[0] = self.G_fu / self.Mtot
         for j in range(ns): self.gsv[j] = self.graw[j] / self.Mtot
+        self.eval_level = 2
 
     cdef void eval2(self, double* y) noexcept nogil:
         """eval1, the energy Hessian (hraw) and, for non-linear formula moles, d2m (mhraw) and d2M (hM)."""
         cdef int D = self.D, C = self.C, ns = self.ns, n = self.ns + self.D, i, a, b
         self.eval1(y)
+        if self.eval_level >= 3:
+            return
         self.evals2 += 1
         self.p_hess(&self.hraw[0], &self.inp[0], self.d_hess)
         if not self.linear:
@@ -335,6 +349,7 @@ cdef class CPhase:
                 for a in range(D):
                     for b in range(D):
                         self.hM[a * D + b] += self.mhraw[i * n * n + (ns + a) * n + ns + b]
+        self.eval_level = 3
 
     cdef void y_of_z(self, double* z, double* y) noexcept nogil:
         cdef int b, k, j
@@ -368,6 +383,7 @@ cdef class CPhase:
 
     cdef inline void x_of_y(self, double* y, double* x) noexcept nogil:
         cdef int i
+        self.eval_level = 0
         if not self.linear:
             memcpy(&self.inp[self.ns], y, self.D * sizeof(double))
         self.moles(y)
@@ -885,6 +901,7 @@ cdef class CPhase:
     def set_statevars(self, statevars):
         """New state-variable values (parameters unchanged)."""
         cdef int k
+        self.eval_level = 0
         sv = np.asarray(statevars, dtype=float)
         for k in range(self.ns): self.inp[k] = sv[k]
         self.T = sv[self._t_index]; self.RT = R_GAS * self.T
