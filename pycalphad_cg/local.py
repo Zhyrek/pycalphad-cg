@@ -483,11 +483,20 @@ def _global_min_candidate(point, system_info, tol):
     for ph in phases:
         starts = [np.array(cs.dof[ns:], dtype=float) for cs in stable if cs.phase_record.phase_name == ph.name]
         starts += ph.seeds(z, elements, rng, state=(tuple(sv), tuple(params), ()))
+        seen = set()
         for y0 in starts:
+            # Repeated starts give the same local minimum; keep the first occurrence so ties retain their order.
+            key = y0.tobytes()
+            if key in seen:
+                continue
+            seen.add(key)
             tpd, y, x, G, conv = ph.core.py_price(mu, y0)
             if not np.isfinite(G):
                 continue
             dG = -tpd
+            # A candidate that cannot replace the current best needs no composition/equivalence checks.
+            if best is not None and dG <= best[1]:
+                continue
             k = int(np.argmin([np.max(np.abs(np.asarray(x) - xs)) for xs in stable_x]))
             near = float(np.max(np.abs(np.asarray(x) - stable_x[k])))
             if ((near < TIE_X_NEAR and dG < TIE_DG) or (near < TIE_X and dG < TIE_DG_FAR)) and (
