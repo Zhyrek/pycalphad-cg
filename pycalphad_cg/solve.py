@@ -74,6 +74,7 @@ class _Phase:
         self._line_cache = {}   # (state, end member, end member) -> starts on that line (see seeds)
         self.clones = []   # copies of core for worker threads (own buffers, shared compiled functions)
         self.stoichiometric = all(len(b) == 1 for b in self.blocks)
+        self._gauge_rows = None   # admissible compositions without phase-local conditions (static structure)
 
     def core_for(self, worker):
         """The phase's core object for worker thread `worker` (0: the original)."""
@@ -136,6 +137,9 @@ class _Phase:
         a hashable key of that state, under which the line starts are cached."""
         if core is None:
             core = self.core
+        if self.stoichiometric:
+            # Every composition/enrichment/end-member start below is this same point, with no random draws.
+            return [np.ones(self.D)]
         C = len(elements)
         out = [self.composition_start(z, elements)]
         for k in range(C):
@@ -331,6 +335,10 @@ def _gauge_directions(phases, C, local=None):
     for i, ph in enumerate(phases):
         if not ph.linear:
             return np.zeros((0, C))
+        unrestricted = local is None or (not len(local[i][0]) and not np.any(local[i][2]))
+        if unrestricted and ph._gauge_rows is not None:
+            rows.extend(ph._gauge_rows)
+            continue
         E = [ph.E] if len(ph.E) else []
         e = [ph.e] if len(ph.E) else []
         if local is not None:
@@ -346,9 +354,12 @@ def _gauge_directions(phases, C, local=None):
         _, sv, vt = np.linalg.svd(B)
         rank = int(np.sum(sv > 1e-10 * max(sv[0], 1.0)))
         N = vt[rank:].T
-        rows.append(ph.A @ y0)
+        phase_rows = [ph.A @ y0]
         if N.shape[1]:
-            rows.extend((ph.A @ N).T)
+            phase_rows.extend((ph.A @ N).T)
+        if unrestricted:
+            ph._gauge_rows = phase_rows
+        rows.extend(phase_rows)
     M = np.array(rows)
     _, sv, vt = np.linalg.svd(M, full_matrices=True)
     rank = int(np.sum(sv > 1e-10 * max(sv[0], 1.0)))
