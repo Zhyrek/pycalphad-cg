@@ -482,7 +482,11 @@ def _global_min_candidate(point, system_info, tol):
     stable_x = [np.asarray(cs.X, dtype=float) for cs in stable]
     for ph in phases:
         starts = [np.array(cs.dof[ns:], dtype=float) for cs in stable if cs.phase_record.phase_name == ph.name]
-        starts += ph.seeds(z, elements, rng, state=(tuple(sv), tuple(params), ()))
+        if ph.stoichiometric:
+            # Every generated start is all ones, and this phase consumes no random draws in seeds().
+            starts.append(np.ones(ph.D))
+        else:
+            starts += ph.seeds(z, elements, rng, state=(tuple(sv), tuple(params), ()))
         seen = set()
         for y0 in starts:
             # Repeated starts give the same local minimum; keep the first occurrence so ties retain their order.
@@ -494,8 +498,9 @@ def _global_min_candidate(point, system_info, tol):
             if not np.isfinite(G):
                 continue
             dG = -tpd
-            # A candidate that cannot replace the current best needs no composition/equivalence checks.
-            if best is not None and dG <= best[1]:
+            # Candidates below the requested tolerance or the current best cannot be returned and need no
+            # composition/equivalence checks.
+            if dG < tol or (best is not None and dG <= best[1]):
                 continue
             k = int(np.argmin([np.max(np.abs(np.asarray(x) - xs)) for xs in stable_x]))
             near = float(np.max(np.abs(np.asarray(x) - stable_x[k])))
