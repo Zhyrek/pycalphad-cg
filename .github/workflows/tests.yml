@@ -18,9 +18,11 @@ jobs:
         python-version: ['3.11', '3.13']
         pycalphad: [release, develop]
         include:
-          # (pycalphad 0.11.2 does not install on Python 3.14; its develop branch does)
+          # (Python 3.14 and 3.15: pycalphad >= 0.12, whose symengine has wheels for them)
           - {os: ubuntu-latest, python-version: '3.14', pycalphad: develop}
           - {os: windows-latest, python-version: '3.14', pycalphad: develop}
+          - {os: ubuntu-latest, python-version: '3.14', pycalphad: release}
+          - {os: ubuntu-latest, python-version: '3.15', pycalphad: develop}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
