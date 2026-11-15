@@ -55,7 +55,9 @@ them by Newton's method. Column generation needs no grid:
 Because the minimization works directly against the hyperplane, column generation finds states that a fixed grid
 can miss (for example ordered states that occupy a small region of site-fraction space). Conditions that share
 state variables are solved in sequence, each starting from the previous one's points, on worker threads that run
-without the GIL.
+without the GIL. A warm start prices each phase from the points found so far, so it can miss a basin that no earlier
+condition reached; after the sweep, the states of each condition's grid neighbours are priced at its chemical
+potentials, and a condition with a neighbour's state below its hyperplane is solved again from fresh starts.
 
 ## Options
 
@@ -119,6 +121,15 @@ pycalphad#762 (Al-Ni with a four-sublattice FCC, `AlNi-22Yan.tdb` attached to th
 where pycalphad misses L1<sub>2</sub> below the invariants, pass with `pycalphad_cg.Workspace` in place of
 `Workspace`.
 
+**Maps against point equilibria.** `tools/census` maps 12 binaries and 5 ternary isothermal sections from pycalphad's
+test databases and checks every map on a grid of about 55,000 probes against point equilibria, among them the
+equilibrium restricted to the phases each map shows there (`groundtruth.py`). Column generation's point equilibria
+are never above the lowest energy found; pycalphad's (with `pdens` 1000 for binaries, 500 for the sections) are at
+549 probes, by up to 385 J/mol. On pycalphad develop, the maps drawn with column generation show the wrong phases at
+247 probes (118 of them with an energy error above 1 J/mol), pycalphad's own at 704 (401). Most of what remains is
+pycalphad's mapping strategy (lines that end before their invariant, fields no starting point reaches) and the same
+with either solver.
+
 **This package's tests** (`pytest tests`) compare with pycalphad on binaries and ternaries from pycalphad's test
 databases:
 
@@ -160,10 +171,10 @@ takes the same time on both.
   pycalphad finds B2 alone), and never higher.
 - **Threads** pay off from a few hundred conditions; at 100 conditions the fixed cost of building the Workspace
   dominates.
-- **Mapping:** 17 maps (12 binaries, 5 ternary isothermal sections; `tools/census`) take 25.3 s with column
-  generation against 28.9 s with pycalphad's own solver (pycalphad develop, median of 3; 16 maps without the Ba-Ca
-  database, which is not included). Ternary sections are faster (Al-Cr-Ni at 1300 K: 2.4 s against 3.9 s), some binaries slower (Co-V: 4.2 s
-  against 3.4 s).
+- **Mapping:** 17 maps (12 binaries, 5 ternary isothermal sections; `tools/census`) take 24.0 s with column
+  generation against 29.6 s with pycalphad's own solver (pycalphad develop, median of 3; 16 maps without the Ba-Ca
+  database, which is not included). Ternary sections are faster (Al-Cr-Ni at 1300 K: 2.4 s against 4.0 s), binaries
+  about the same (Co-V: 3.3 s against 3.6 s, Al-Ni: 2.1 s against 1.7 s).
 
 ## Limits
 
@@ -194,6 +205,10 @@ takes the same time on both.
 ## Where results differ from pycalphad
 
 - Gibbs energies lower than pycalphad's where its grid misses a state (see Performance).
+- A state that two phases of the system describe, an ordered phase in its disordered state and a phase that is an
+  exact copy of its disordered part (FCC_A1 beside FCC_4SL in the Co-V and Au-Cu test databases), is reported under
+  the alphabetically first of the two names. pycalphad reports either, depending on its grid; with one name, mapping
+  draws each such boundary once.
 - Ratio conditions such as `v.X('NI') / v.X('ZN')` in systems with more components than the ratio names: pycalphad's
   own solver takes the denominator's column by its position among the condition's symbols rather than by element,
   so its result does not meet the condition in some systems; column generation meets it.

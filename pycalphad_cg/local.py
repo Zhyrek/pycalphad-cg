@@ -20,8 +20,8 @@ from pycalphad.core.composition_set import CompositionSet
 from pycalphad.core.constants import COMP_DIFFERENCE_TOL
 from pycalphad.core.solver import Solver, SolverBase, SolverResult
 from pycalphad_cg import _cgmode
-from pycalphad_cg.solve import (_phases_for, _condition_rows, _local_constraints, _raise_load_errors,
-                                CGCapabilityError, SOLVE_LOCK)
+from pycalphad_cg.solve import (_phases_for, _descriptions, _first_description, _condition_rows, _local_constraints,
+                                _raise_load_errors, CGCapabilityError, SOLVE_LOCK)
 
 __all__ = ['CGSolver', 'global_min_candidate']
 
@@ -535,6 +535,8 @@ def _global_min_candidate(point, system_info, tol):
     _check_mapping_load_errors(phases)
     if best is None or best[1] < tol:
         return None
-    cs = CompositionSet(prf[best[0]])
-    cs.update(np.asarray(best[2], dtype=np.float64), 1.0, sv)
+    # (a state two phases describe: by the name equilibrium results give it, see solve.DISORDER_TOL)
+    name, y = _first_description(_descriptions(list(phases), sv_names, params), best[0], best[2])
+    cs = CompositionSet(prf[name])
+    cs.update(np.asarray(y, dtype=np.float64), 1.0, sv)
     return cs, best[1]

@@ -252,3 +252,35 @@ def test_ratio_condition_is_met():
     conds = {v.N: 1, v.P: 101325, v.T: 300, v.X('AL'): 0.2, v.X('NI') / v.X('ZN'): 2}
     x = CGWorkspace(dbf, ['AL', 'NI', 'ZN'], ['LIQUID'], conds).eq.X.reshape(-1, 3)[0]
     np.testing.assert_allclose(x, [0.2, 0.8 * 2 / 3, 0.8 / 3], atol=1e-9)
+
+
+def test_one_name_for_a_state_two_phases_describe():
+    """CoV-20Wan.tdb defines FCC_A1 as an exact copy of FCC_4SL's disordered part: the disordered fcc state is reported
+    under one name (the alphabetically first, FCC_4SL), wherever it is stable."""
+    from pycalphad.core.utils import filter_phases, unpack_species
+    dbf = _db('CoV-20Wan.tdb')
+    comps = ['CO', 'V', 'VA']
+    phases = filter_phases(dbf, unpack_species(dbf, comps))
+    assert {'FCC_A1', 'FCC_4SL'} <= set(phases)
+    eq = CGWorkspace(dbf, comps, phases, {v.T: (900, 1801, 100), v.X('V'): (0.02, 0.4, 0.04), v.P: 101325,
+                                          v.N: 1}).eq
+    names = set(np.asarray(eq.Phase).ravel()) - {''}
+    assert 'FCC_4SL' in names and 'FCC_A1' not in names
+
+
+def test_grid_neighbours_correct_a_missed_basin():
+    """Al-Co-Ni at 1233 K on a 0.02 grid: warm-started from its neighbours, x(Co) = 0.03, x(Ni) = 0.29 missed the
+    B2 basin there (AL13CO4 + AL3NI2 + LIQUID, 3.8 J/mol above AL3NI2 + BCC_B2 + LIQUID). The neighbours' states,
+    priced at its chemical potentials, show the miss, and the condition is solved again."""
+    from pycalphad.core.utils import filter_phases, unpack_species
+    dbf = _db('alcocrni.tdb')
+    comps = ['AL', 'CO', 'NI', 'VA']
+    phases = filter_phases(dbf, unpack_species(dbf, comps))
+    xs = np.arange(0.01, 1.0, 0.02)
+    grid = CGWorkspace(dbf, comps, phases, {v.T: 1233.01, v.X('CO'): xs, v.X('NI'): xs, v.P: 101325, v.N: 1}).eq
+    point = CGWorkspace(dbf, comps, phases, {v.T: 1233.01, v.X('CO'): xs[1], v.X('NI'): xs[14], v.P: 101325,
+                                             v.N: 1}).eq
+    gm = np.asarray(grid.GM).reshape(len(xs), len(xs))[1, 14]
+    assert abs(gm - float(np.squeeze(point.GM))) < GM_TOL
+    names = set(np.asarray(grid.Phase).reshape(len(xs), len(xs), -1)[1, 14]) - {''}
+    assert names == {'AL3NI2', 'BCC_B2', 'LIQUID'}

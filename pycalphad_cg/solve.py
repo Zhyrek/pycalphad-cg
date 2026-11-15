@@ -6,7 +6,7 @@ dataset in the layout of pycalphad's own.
 import itertools
 import os
 import threading
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 
 import numpy as np
 
@@ -311,6 +311,98 @@ def _phases_for(prf, elements):
             _PHASE_CACHE.move_to_end(key)
         phases.append(ph)
     return phases
+
+
+# One state in two descriptions: an ordered phase (a partitioned model) in its disordered state, and a phase with the
+# structure of its disordered part and the same energy everywhere (that disordered part, when the system has it, or a
+# copy of it: e.g. FCC_A1 beside FCC_4SL in databases that define both). Which of the two a solve finds for such a state
+# is otherwise arbitrary (the linear program takes either), and mapping, which tells states apart by phase name, then
+# traces one boundary under both names. Results name such a state by the alphabetically first of the two phases, as
+# the mapping's global-minimum check (local.py) also keeps the first of equal candidates.
+DISORDER_TOL = 1e-6
+_DESCRIPTIONS = OrderedDict()   # (phases, state variables, parameters) -> {phase: [(other phase, conversion)]}
+
+
+def _ordered_structure(O, F):
+    """For each of O's site fractions, the index of F's site fraction it equals in O's disordered state; or None if F
+    does not have the structure of O's disordered part (F's first sublattice: O's ordered sublattices merged; an
+    interstitial second sublattice of F: O's last)."""
+    trailing = len(F.blocks) - 1
+    if trailing > 1 or len(O.blocks) - trailing < 2:
+        return None
+    ordered = O.blocks[:len(O.blocks) - trailing]
+    pairs = [(blk, F.blocks[0]) for blk in ordered] + ([(O.blocks[-1], F.blocks[1])] if trailing else [])
+    index = np.full(O.D, -1)
+    for ob, fb in pairs:
+        f_of = {F.species_names[j]: j for j in fb}
+        if sorted(O.species_names[j] for j in ob) != sorted(f_of):
+            return None
+        for j in ob:
+            index[j] = f_of[O.species_names[j]]
+    return index
+
+
+def _same_energy(O, F, index, sv_names, params):
+    """Whether O at F's site fractions spread over its ordered sublattices has F's energy (per mole of atoms), at
+    random site fractions and several temperatures (on copies of the compiled phases, whose state is left alone)."""
+    if any(name not in ('N', 'P', 'T') for name in sv_names):
+        return False
+    co, cf = O.core.clone(), F.core.clone()
+    rng = np.random.default_rng(0)
+    for T in (500.0, 1100.0, 1900.0):
+        sv = np.array([{'N': 1.0, 'P': 101325.0, 'T': T}[name] for name in sv_names])
+        co.set_state(sv, params); cf.set_state(sv, params)
+        for _ in range(4):
+            y = np.empty(F.D)
+            for b in F.blocks:
+                y[b] = rng.dirichlet(np.ones(len(b)))
+            gf, go = cf.evaluate(y)[0], co.evaluate(y[index])[0]
+            if not (np.isfinite(gf) and abs(gf - go) <= 1e-7 * max(1.0, abs(gf))):
+                return False
+    return True
+
+
+def _descriptions(phases, sv_names, params):
+    """{phase name: [(other phase name, conversion of site fractions or None)]}: for each phase that can be in a state
+    another phase describes too (see DISORDER_TOL), the alphabetically earlier phase and the conversion to it (it
+    returns None where the state is not shared: an ordered state)."""
+    key = (tuple(id(ph) for ph in phases), tuple(sv_names), tuple(float(p) for p in params))
+    out = _DESCRIPTIONS.get(key)
+    if out is not None:
+        return out
+    out = {}
+    for O in phases:
+        for F in phases:
+            if F is O or len(F.blocks) >= len(O.blocks):
+                continue
+            index = _ordered_structure(O, F)
+            if index is None or not _same_energy(O, F, index, sv_names, params):
+                continue
+            if F.name < O.name:
+                def to_disordered(y, index=index, D=F.D):
+                    y = np.asarray(y, dtype=float)
+                    yf = np.zeros(D); seen = np.zeros(D, dtype=bool)
+                    for j, i in enumerate(index):
+                        if seen[i] and abs(yf[i] - y[j]) > DISORDER_TOL:
+                            return None
+                        yf[i] = y[j]; seen[i] = True
+                    return yf
+                out.setdefault(O.name, []).append((F.name, to_disordered))
+            else:
+                out.setdefault(F.name, []).append((O.name, lambda y, index=index: np.asarray(y, dtype=float)[index]))
+    _DESCRIPTIONS[key] = out
+    if len(_DESCRIPTIONS) > 32:
+        _DESCRIPTIONS.popitem(last=False)
+    return out
+
+
+def _first_description(descriptions, name, y):
+    """(phase name, site fractions) of the alphabetically first description of the state (name, y)"""
+    for other, convert in sorted(descriptions.get(name, ()), key=lambda d: d[0]):
+        y2 = convert(y)
+        if y2 is not None:
+            return _first_description(descriptions, other, y2)
+    return name, y
 
 
 def _raise_load_errors(phases):
@@ -745,6 +837,122 @@ class _Worker:
         return seeds
 
 
+# Warm-started conditions are priced from the point store (the seeds of their sequence's first condition and the
+# minima found since), so a basin of a phase that no earlier condition reached can be missed (e.g. an ordered phase's
+# composition pocket between the conditions solved before). After the sweep, each condition's grid neighbours' states
+# are priced at its chemical potentials; one below its tangent plane by more than NEIGHBOUR_TOL (in RT) means a missed
+# minimum, and the condition is solved again from fresh seeds plus those states. At most NEIGHBOUR_PASSES passes (a
+# corrected condition can correct its neighbours in turn).
+NEIGHBOUR_TOL = 1e-5
+NEIGHBOUR_PASSES = 3
+# A neighbour's state this close (site fractions) to one of the condition's own stable states is in the same basin
+NEIGHBOUR_SAME_BASIN = 0.05
+
+
+def _adjacent(idx, axes, shape):
+    for ax in axes:
+        for d in (-1, 1):
+            if 0 <= idx[ax] + d < shape[ax]:
+                yield idx[:ax] + (idx[ax] + d,) + idx[ax + 1:]
+
+
+def _neighbour_pass(worker, phases, names, groups, shape, axes, GM, MU, Phase, Y, NP, X, write, elements,
+                    molar_masses, params, t_index):
+    axes = [i for i in axes if shape[i] > 1]
+    if not axes:
+        return
+    index_of = {name: i for i, name in enumerate(names)}
+    where = {idx: (g, sv_values, point) for g, (key, sv_values, items) in enumerate(groups) for idx, point in items}
+    rng = np.random.default_rng(0)
+    nvert = Phase.shape[-1]
+
+    def states(idx):
+        """(phase indices, site fractions padded with -1) of the condition's stable states"""
+        k = 0
+        while k < nvert and Phase[idx + (k,)]:
+            k += 1
+        P = np.array([index_of[Phase[idx + (a,)]] for a in range(k)], dtype=int)
+        return P, np.nan_to_num(np.asarray(Y[idx][:k], dtype=float), nan=-1.0)
+
+    # neighbour pairs with a state the condition does not have in the same basin (whole-grid arrays; most pairs, in
+    # the same phase field, have none)
+    codes = np.full(Phase.shape, -1, dtype=int)
+    for name, i in index_of.items():
+        codes[Phase == name] = i
+    Yc = np.nan_to_num(np.asarray(Y, dtype=float), nan=-1.0)
+    neighbours = defaultdict(list)
+    for ax in axes:
+        for d in (-1, 1):
+            n = shape[ax] - 1
+            mine = [slice(None)] * len(shape); theirs = [slice(None)] * len(shape)
+            mine[ax] = slice(0, n) if d > 0 else slice(1, None)
+            theirs[ax] = slice(1, None) if d > 0 else slice(0, n)
+            cm, ct = codes[tuple(mine)], codes[tuple(theirs)]
+            ym, yt = Yc[tuple(mine)], Yc[tuple(theirs)]
+            # [..., their vertex, my vertex]
+            same = ((ct[..., :, None] == cm[..., None, :])
+                    & (np.abs(yt[..., :, None, :] - ym[..., None, :, :]).max(axis=-1) < NEIGHBOUR_SAME_BASIN))
+            new = ((ct >= 0) & ~same.any(axis=-1)).any(axis=-1)
+            for k in zip(*np.nonzero(new)):
+                idx = tuple(int(i) + (1 if (a == ax and d < 0) else 0) for a, i in enumerate(k))
+                neighbours[idx].append(idx[:ax] + (idx[ax] + d,) + idx[ax + 1:])
+    known = {idx: states(idx) for idx in where if np.isfinite(GM[idx])}
+    todo = sorted((idx for idx in neighbours if idx in where), key=lambda i: where[i][0])
+    for _ in range(NEIGHBOUR_PASSES):
+        changed = []
+        state_of = None
+        for idx in todo:
+            own = known.get(idx)
+            if own is None:
+                continue
+            starts = {}
+            for j in neighbours[idx]:
+                other = known.get(j)
+                if other is None or not len(other[0]):
+                    continue
+                # a neighbour's state of a phase the condition has in the same basin is no new start
+                same = ((other[0][:, None] == own[0][None, :])
+                        & (np.abs(other[1][:, None, :] - own[1][None, :, :]).max(axis=2) < NEIGHBOUR_SAME_BASIN))
+                for r in np.flatnonzero(~same.any(axis=1)):
+                    p = int(other[0][r])
+                    y = other[1][r, :phases[p].D]
+                    if not any(np.array_equal(y, s) for s in starts.get(p, ())):
+                        starts.setdefault(p, []).append(y)
+            if not starts:
+                continue
+            g, sv_values, point = where[idx]
+            if state_of != g:
+                for core in worker.cores:
+                    core.set_state(sv_values, params)
+                worker.state_key = (tuple(sv_values), tuple(params), ())   # (as prepare() keys it)
+                state_of = g
+            T = float(sv_values[t_index]) if t_index is not None else 298.15
+            tol = NEIGHBOUR_TOL * R_GAS * T
+            mu = np.asarray(MU[idx], dtype=float)
+            if not any(worker.cores[p].py_price(mu, y)[0] < -tol for p, ys in starts.items() for y in ys):
+                continue
+            seeds = worker.reseed(phases, point, elements, rng, t_index)
+            for p, ys in starts.items():
+                worker.solver.add_points(p, np.array(ys))
+                seeds[p] = np.vstack([seeds[p], ys])
+            out = _solve_point(worker.solver, point, elements, molar_masses, seeds, worker.guess)
+            if out[0] != 0:
+                continue
+            ns, Gs = out[4], out[5]
+            if sum(n * g for n, g in zip(ns, Gs)) / sum(ns) < GM[idx] - tol:
+                Phase[idx] = ''; NP[idx] = np.nan; X[idx] = np.nan; Y[idx] = np.nan
+                write(idx, out)
+                known[idx] = states(idx)
+                changed.append(idx)
+        # (only the neighbours of corrected conditions can change in the next pass)
+        todo = sorted({j for idx in changed for j in _adjacent(idx, axes, shape) if j in where},
+                      key=lambda i: where[i][0])
+        for idx in todo:
+            neighbours[idx] = list(_adjacent(idx, axes, shape))
+        if not todo:
+            return
+
+
 def solve_workspace(wks, threads=None):
     """The equilibrium dataset (pycalphad's layout) for a Workspace, computed by column generation. Conditions are
     solved in sequences that share state variables (warm-started); sequences, or contiguous parts of one, run on
@@ -772,6 +980,8 @@ def _solve_workspace(wks, threads):
     phases = _phases_for(prf, elements)
     names = [ph.name for ph in phases]
     params = np.array(prf.param_values, dtype=float)   # (a copy: the factory can be shared and updated)
+    descriptions = _descriptions(phases, [str(sv) for sv in prf.state_variables], params)
+    index_of = {name: i for i, name in enumerate(names)}
     molar_masses = np.asarray(prf.molar_masses, dtype=float)
 
     keys = list(conds.keys())
@@ -807,7 +1017,12 @@ def _solve_workspace(wks, threads):
 
     def write(idx, out):
         status, phs, Ys, Xs, ns, Gs, mu, rounds = out
-        phs, Ys, Xs, ns, Gs = _drop_negligible(_consolidate((list(phs), list(Ys), list(Xs), list(ns), list(Gs))))
+        phs, Ys = list(phs), list(Ys)
+        if descriptions:
+            for a in range(len(phs)):
+                name, Ys[a] = _first_description(descriptions, names[phs[a]], Ys[a])
+                phs[a] = index_of[name]
+        phs, Ys, Xs, ns, Gs = _drop_negligible(_consolidate((phs, Ys, list(Xs), list(ns), list(Gs))))
         # vertex order as the reference's (its hull lists grid points, which are grouped by sorted phase name)
         perm = sorted(range(len(phs)), key=lambda a: (names[phs[a]], tuple(-Xs[a])))
         phs, Ys, Xs, ns, Gs = ([seq[a] for a in perm] for seq in (phs, Ys, Xs, ns, Gs))
@@ -907,6 +1122,9 @@ def _solve_workspace(wks, threads):
                     for f in futures:
                         f.result()
 
+    if not local_pos and not any(isinstance(k, v.ChemicalPotential) for k in keys):
+        _neighbour_pass(workers[0], phases, names, groups, shape, other_pos, GM, MU, Phase, Y, NP, X, write,
+                        elements, molar_masses, params, t_index)
     _raise_load_errors(phases)
     coords = OrderedDict((str(k), conds[k]) for k in keys)
     coords['vertex'] = np.arange(nvert)

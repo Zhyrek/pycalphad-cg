@@ -24,10 +24,19 @@ EDGE_TOL = 2e-5           # 2 * MIN_COMPOSITION
 COVER_TOL = 0.5           # missing regions: in axis steps
 
 
+def label(cs):
+    """The state of a composition set (states.py): an ordered phase in its disordered state is the disordered phase"""
+    return cs.get("label", cs["phase"])
+
+
+def point_key(point):
+    return tuple(sorted(label(cs) for cs in point["sets"]))
+
+
 def location(point, mp, relative_T):
-    """Compositions of all composition sets, and T (relative to the T range, or in T steps)"""
+    """Compositions of all composition sets (by state), and T (relative to the T range, or in T steps)"""
     row = []
-    for cs in point["sets"]:
+    for cs in sorted(point["sets"], key=lambda cs: (label(cs), tuple(cs["X"]))):
         row.extend(np.asarray(cs["X"]) / (1.0 if relative_T else mp["axis"]["x_step"]))
     if mp["axis"]["T"] is not None:
         lo, hi = mp["axis"]["T"]["lims"]
@@ -35,8 +44,22 @@ def location(point, mp, relative_T):
     return np.array(row)
 
 
+def line_runs(line, mp, relative_T):
+    """The line's points with all of its phases stable, as runs of consecutive points of the same states:
+    [(states, locations)]"""
+    runs = []
+    for p in line["points"]:
+        if len(p["sets"]) != len(line["phases"]):
+            continue
+        key = point_key(p)
+        if not runs or runs[-1][0] != key:
+            runs.append((key, []))
+        runs[-1][1].append(location(p, mp, relative_T))
+    return [(key, np.array(rows)) for key, rows in runs]
+
+
 def line_locations(line, mp, relative_T):
-    rows = [location(p, mp, relative_T) for p in line["points"] if [cs["phase"] for cs in p["sets"]] == line["phases"]]
+    rows = [location(p, mp, relative_T) for p in line["points"] if len(p["sets"]) == len(line["phases"])]
     return np.array(rows) if rows else np.zeros((0, 0))
 
 
@@ -57,19 +80,18 @@ def on_polyline(p, L):
 
 
 def duplicate_pairs(mp):
-    """Pairs of lines with the same phases where more than half of the points of the shorter one lie on the other
-    (within DUPLICATE_TOL axis steps, and not beyond its ends): the same boundary drawn twice"""
-    pairs = []
-    lines = mp["lines"]
-    locs = [line_locations(z, mp, False) for z in lines]
-    for i, j in itertools.combinations(range(len(lines)), 2):
-        a, b = lines[i], lines[j]
-        if a["phases"] != b["phases"] or min(len(locs[i]), len(locs[j])) < 2:
+    """Pairs of lines with runs of the same states where more than half of the points of the shorter run lie on the
+    other (within DUPLICATE_TOL axis steps, and not beyond its ends): the same boundary drawn twice, possibly under
+    two names of one state (an ordered phase in its disordered state and the disordered phase)"""
+    pairs = set()
+    runs = [(i, key, L) for i, z in enumerate(mp["lines"]) for key, L in line_runs(z, mp, False)]
+    for (i, ka, La), (j, kb, Lb) in itertools.combinations(runs, 2):
+        if i == j or ka != kb or min(len(La), len(Lb)) < 2:
             continue
-        A, B = (locs[i], locs[j]) if len(locs[i]) <= len(locs[j]) else (locs[j], locs[i])
+        A, B = (La, Lb) if len(La) <= len(Lb) else (Lb, La)
         if np.mean([on_polyline(row, B) for row in A]) > 0.5:
-            pairs.append((i, j))
-    return pairs
+            pairs.add((i, j))
+    return sorted(pairs)
 
 
 def zero_width(line):
@@ -104,20 +126,25 @@ def distance_to_polyline(p, L):
     return np.min(np.linalg.norm(p - (a + t[:, None] * d), axis=1))
 
 
-def uncovered(mp_a, mp_b):
-    """Points of mp_a's lines that are not on a line of mp_b with the same phases: Counter by phases"""
-    by_phases = {}
+def uncovered(mp_a, mp_b, points=False):
+    """Points of mp_a's lines that are not on a line of mp_b with the same states: Counter by states (with
+    points=True, also the list of (states, point))"""
+    by_states = {}
     for z in mp_b["lines"]:
-        L = line_locations(z, mp_b, False)
-        if len(L):
-            by_phases.setdefault(tuple(z["phases"]), []).append(L)
+        for key, L in line_runs(z, mp_b, False):
+            by_states.setdefault(key, []).append(L)
     missing = Counter()
+    found = []
     for z in mp_a["lines"]:
-        for p in line_locations(z, mp_a, False):
-            others = by_phases.get(tuple(z["phases"]), [])
+        for P in z["points"]:
+            if len(P["sets"]) != len(z["phases"]):
+                continue
+            key, p = point_key(P), location(P, mp_a, False)
+            others = by_states.get(key, [])
             if not others or min(distance_to_polyline(p, L) for L in others) > COVER_TOL:
-                missing[" + ".join(z["phases"])] += 1
-    return missing
+                missing[" + ".join(key)] += 1
+                found.append((key, P))
+    return (missing, found) if points else missing
 
 
 def summary(mp):
@@ -128,8 +155,8 @@ def summary(mp):
         "duplicate_pairs": len(duplicate_pairs(mp)),
         "zero_width_lines": sum(zero_width(z) for z in mp["lines"]),
         "edge_lines": sum(edge_line(z) for z in mp["lines"]),
-        "phase_pairs": sorted({" + ".join(z["phases"]) for z in mp["lines"]}),
-        "node_phases": sorted({" + ".join(sorted(cs["phase"] for cs in n["sets"])) for n in mp["nodes"]}),
+        "phase_pairs": sorted({" + ".join(key) for z in mp["lines"] for key, _ in line_runs(z, mp, False)}),
+        "node_phases": sorted({" + ".join(point_key(n)) for n in mp["nodes"]}),
         "elapsed": round(mp["elapsed"], 1),
     }
 

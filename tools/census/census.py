@@ -26,6 +26,9 @@ from pycalphad import Database, variables as v
 from pycalphad.core.utils import filter_phases, unpack_species
 import pycalphad.mapping as mapping
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from states import Labeler  # noqa: E402
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # (name, database, components, phases (None: all), T range, x step) for binaries; the second component is the axis
@@ -74,14 +77,16 @@ def strategy_class(ternary):
     return mapping.TernaryStrategy if ternary else mapping.BinaryStrategy
 
 
-def comp_set_record(cs):
-    return {"phase": cs.phase_record.phase_name, "X": [float(x) for x in cs.X], "NP": float(cs.NP)}
+def comp_set_record(cs, labeler):
+    pr = cs.phase_record
+    return {"phase": pr.phase_name, "label": labeler.label_compset(cs), "X": [float(x) for x in cs.X],
+            "NP": float(cs.NP), "Y": [float(y) for y in np.asarray(cs.dof)[pr.num_statevars:]]}
 
 
-def point_record(point, axis_vars):
+def point_record(point, labeler):
     sets = sorted(point.stable_composition_sets, key=lambda cs: (cs.phase_record.phase_name, tuple(cs.X)))
     return {"T": float(np.squeeze(point.global_conditions[v.T])) if v.T in point.global_conditions else None,
-            "sets": [comp_set_record(cs) for cs in sets],
+            "sets": [comp_set_record(cs, labeler) for cs in sets],
             "fixed": sorted(cs.phase_record.phase_name for cs in point.fixed_composition_sets)}
 
 
@@ -92,13 +97,14 @@ def run_map(name, db_name, comps, conds, ternary, elements):
         return None
     comps = comps + ["VA"]
     phases = filter_phases(dbf, unpack_species(dbf, comps))
+    labeler = Labeler(dbf, comps, phases)
     t0 = time.time()
     strategy = strategy_class(ternary)(dbf, comps, phases, conds)
     strategy.do_map()
     elapsed = time.time() - t0
     lines = [{"phases": sorted(z.stable_phases), "fixed": sorted(z.fixed_phases), "status": z.status.name,
-              "points": [point_record(p, strategy.axis_vars) for p in z.points]} for z in strategy.zpf_lines]
-    nodes = [point_record(n, strategy.axis_vars) for n in strategy.node_queue.nodes if len(n.stable_composition_sets) >= 3]
+              "points": [point_record(p, labeler) for p in z.points]} for z in strategy.zpf_lines]
+    nodes = [point_record(n, labeler) for n in strategy.node_queue.nodes if len(n.stable_composition_sets) >= 3]
     axis = {"T": {"lims": [float(x) for x in conds[v.T][:2]], "step": float(conds[v.T][2])} if isinstance(conds[v.T], tuple) else None,
             "x_step": float([val for key, val in conds.items() if isinstance(key, v.X)][0][2])}
     return {"name": name, "database": db_name, "elements": elements, "ternary": ternary, "elapsed": elapsed,
