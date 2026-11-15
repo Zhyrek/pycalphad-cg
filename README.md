@@ -132,21 +132,24 @@ databases:
 
 ## Performance
 
-`examples/timing.py` on an Apple M4 (10 cores): wall time per call, warm (the first call, which compiles the
-phases' energy functions, is not timed), including building the Workspace (its models and phase records), which
-is the same for both. The last column is the largest amount by which column generation's Gibbs energy is below
-pycalphad's; it is never above pycalphad's by more than 0.0014 J/mol.
+`examples/timing.py` on an Apple M4 (10 cores), pycalphad 0.12.0 (develop is the same within 2%): wall time per
+call, warm (the first call, which compiles the phases' energy functions, is not timed), including building the
+Workspace (its models and phase records), which is pycalphad's work and the same for both; for the COST507 systems
+that is most of column generation's time (about 2 s of the 2.6 s with 10 elements). The last column is the largest
+amount by which column generation's Gibbs energy is below pycalphad's; it is never above pycalphad's by more than
+0.0014 J/mol.
 
-| System | Conditions | pycalphad develop | cg, 1 thread | cg, 10 threads | pycalphad 0.11.2 | cg lower by, at most (J/mol) |
-|---|---|---|---|---|---|---|
-| Al-Ni (alni_dupin_2001), 1200 K | 500 | 0.17 s | 0.07 s | 0.04 s | 0.28 s | 7e-5 |
-| Al-Fe (Al-Fe_sundman2009), 900 K | 500 | 1.27 s | 0.43 s | 0.16 s | 1.55 s | 39 |
-| Al-Fe (alfe), 500–1900 K | 15 × 25 | 0.12 s | 0.05 s | 0.03 s | 0.19 s | 22 |
-| Al-Cr-Ni (alcrni), 1273 K | 25 × 25 | 0.40 s | 0.15 s | 0.06 s | 0.62 s | 150 |
-| COST507 Al-Mg-Si-Cu-Zn, 800 K | 100 | 0.69 s | 0.44 s | 0.44 s | 1.57 s | 4e-6 |
-| COST507, 10 elements, 800 K | 100 | 6.81 s | 2.62 s | 2.67 s | 21.0 s | 5e-4 |
+| System | Conditions | pycalphad | cg, 1 thread | cg, 10 threads | cg lower by, at most (J/mol) |
+|---|---|---|---|---|---|
+| Al-Ni (alni_dupin_2001), 1200 K | 500 | 0.17 s | 0.06 s | 0.04 s | 7e-5 |
+| Al-Fe (Al-Fe_sundman2009), 900 K | 500 | 1.27 s | 0.37 s | 0.14 s | 39 |
+| Al-Fe (alfe), 500–1900 K | 15 × 25 | 0.12 s | 0.04 s | 0.03 s | 22 |
+| Al-Cr-Ni (alcrni), 1273 K | 24 × 24 | 0.40 s | 0.12 s | 0.06 s | 150 |
+| COST507 Al-Mg-Si-Cu-Zn, 800 K | 101 | 0.69 s | 0.42 s | 0.41 s | 4e-6 |
+| COST507, 10 elements, 800 K | 101 | 6.83 s | 2.58 s | 2.61 s | 5e-4 |
 
-(cg's times are the same on both pycalphad versions; the 0.11.2 column is pycalphad's own solver there.)
+pycalphad 0.11.2's own solver is slower than 0.12's (e.g. 21.0 s for COST507 with 10 elements); column generation
+takes the same time on both.
 
 - **Where column generation is lower,** pycalphad's default grid (`pdens` 60) misses a state, and the state is
   real: re-evaluating column generation's phases with `pycalphad.calculate` at its site fractions gives its
@@ -157,8 +160,10 @@ pycalphad's; it is never above pycalphad's by more than 0.0014 J/mol.
   pycalphad finds B2 alone), and never higher.
 - **Threads** pay off from a few hundred conditions; at 100 conditions the fixed cost of building the Workspace
   dominates.
-- **Mapping** with column generation took 2.2 s against pycalphad's 2.9 s for an Al-Ni binary (1000–2000 K), and
-  2.3 s against 3.6 s for the Al-Cr-Ni isotherm at 1273 K.
+- **Mapping:** 17 maps (12 binaries, 5 ternary isothermal sections; `tools/census`) take 25.3 s with column
+  generation against 28.9 s with pycalphad's own solver (pycalphad develop, median of 3; 16 maps without the Ba-Ca
+  database, which is not included). Ternary sections are faster (Al-Cr-Ni at 1300 K: 2.4 s against 3.9 s), some binaries slower (Co-V: 4.2 s
+  against 3.4 s).
 
 ## Limits
 
