@@ -11,6 +11,8 @@ composition sets directly (pycalphad's mapping):
 
 Problems column generation does not handle (CGCapabilityError) are passed to pycalphad's own Solver and grid search.
 """
+from functools import lru_cache
+
 import numpy as np
 
 from pycalphad import variables as v
@@ -53,11 +55,29 @@ TIE_DG_FAR = 0.01
 COLLAPSE = 0.02
 
 
-def _phase_lookup(compsets):
-    prf = compsets[0].phase_record.phase_record_factory
+@lru_cache(maxsize=8)
+def _mapping_phases(prf):
+    """Reuse phases for a compiled factory, as the factory already does for its compiled functions. Parameter
+    values and state variables are still set on each call. Bound the number of factories retained across maps."""
     elements = [str(e) for e in prf.nonvacant_elements]
     phases = _phases_for(prf, elements)
-    return prf, elements, {ph.name: ph for ph in phases}
+    return elements, {ph.name: ph for ph in phases}
+
+
+def _phase_lookup(compsets):
+    prf = compsets[0].phase_record.phase_record_factory
+    elements, phases = _mapping_phases(prf)
+    return prf, elements, phases
+
+
+def _check_mapping_load_errors(phases):
+    try:
+        _raise_load_errors(phases)
+    except Exception:
+        # _raise_load_errors evicts failed cores from the shared phase cache. Drop our references too, so a
+        # transient derivative-compilation failure is retried with fresh cores on the next call.
+        _mapping_phases.cache_clear()
+        raise
 
 
 def _as_statevar_conditions(conditions):
@@ -426,7 +446,7 @@ class CGSolver(SolverBase):
             for a in active:
                 sets[a].update(ys[a], max(n[a], 0.0) if not is_fixed[a] else sets[a].NP, sv)
             mu = _initial_potentials([sets[active[0]]], phases, mu_fixed, fixed)
-        _raise_load_errors(phases.values())
+        _check_mapping_load_errors(phases.values())
         # write back
         for a, cs in enumerate(sets):
             cs.update(ys[a], max(n[a], 0.0) if not is_fixed[a] else cs.NP, sv)
@@ -456,15 +476,14 @@ def global_min_candidate(point, system_info, tol=1e-5):
 
 def _global_min_candidate(point, system_info, tol):
     prf = system_info['phase_records']
-    elements = [str(e) for e in prf.nonvacant_elements]
-    phases = _phases_for(prf, elements)
+    elements, by_name = _mapping_phases(prf)
+    phases = by_name.values()
     stable = point.stable_composition_sets
     if not stable:
         return None
     ns = len(prf.state_variables)
     sv = np.array(stable[0].dof[:ns], dtype=float)
     params = np.array(prf.param_values, dtype=float)
-    by_name = {ph.name: ph for ph in phases}
     sv_names = [str(s) for s in prf.state_variables]
     t_index = sv_names.index('T') if 'T' in sv_names else None
     for ph in phases:
@@ -513,7 +532,7 @@ def _global_min_candidate(point, system_info, tol):
                 continue
             if best is None or dG > best[1]:
                 best = (ph.name, dG, y)
-    _raise_load_errors(phases)
+    _check_mapping_load_errors(phases)
     if best is None or best[1] < tol:
         return None
     cs = CompositionSet(prf[best[0]])
