@@ -427,6 +427,44 @@ def _local_constraints(ph, point, elements):
     return np.array(E).reshape(-1, ph.D), np.array(e), pinned
 
 
+def _sequence_conditions(items, elements, molar_masses):
+    """Batched condition rows for an ordinary sequence, or None if a point needs the trace/potential path.
+
+    All points in a sequence have the same condition keys. For mole-fraction grids the row matrix is constant;
+    only its right-hand side changes. Build that matrix once, and check implied compositions in one NumPy call
+    rather than constructing and solving a small system in Python for every grid point. Other condition types
+    still use _condition_rows so their semantics stay in one place.
+    """
+    point = items[0][1]
+    xkeys = [k for k in point if _is_global_x(k)]
+    if all(k in (v.N, v.P, v.T) or getattr(k, 'phase_name', None) is not None or _is_global_x(k)
+           for k in point):
+        R0, _, _, _ = _condition_rows(point, elements, molar_masses)
+        n, C = len(items), len(elements)
+        R = np.broadcast_to(R0, (n,) + R0.shape)
+        b = np.empty((n, len(R0)))
+        b[:, 0] = [pt.get(v.N, 1.0) for _, pt in items]
+        for j, key in enumerate(xkeys, 1):
+            b[:, j] = np.asarray([pt[key] for _, pt in items]) * b[:, 0]
+        mu_fixed = np.zeros((n, C))
+        fixed = np.zeros((n, C), dtype=np.int32)
+    else:
+        rows = [_condition_rows(pt, elements, molar_masses) for _, pt in items]
+        R, b, mu_fixed, fixed = (np.array(a) for a in zip(*rows))
+        if fixed.any():
+            return None
+    if R.shape[1] == R.shape[2]:
+        try:
+            z = np.linalg.solve(R, b[..., None])[..., 0] / b[:, :1]
+        except np.linalg.LinAlgError:
+            if any(_trace_target(r, rhs, f) is not None for r, rhs, f in zip(R, b, fixed)):
+                return None
+        else:
+            if np.any(np.all(np.isfinite(z), axis=1) & (z.min(axis=1) < TRACE_COMPOSITION)):
+                return None
+    return R, b, mu_fixed, fixed
+
+
 def _nominal_composition(point, elements):
     """A composition for generating start configurations (the given mole fractions, the rest shared equally)."""
     C = len(elements)
@@ -737,20 +775,24 @@ def _solve_workspace(wks, threads):
     # sequences of conditions sharing state variables and phase-local conditions, in a warm-starting order
     sv_pos = [i for i, k in enumerate(keys) if k in (v.N, v.P, v.T)]
     other_pos = [i for i in range(len(keys)) if i not in sv_pos]
-    order = sorted(itertools.product(*[range(s) for s in shape]),
-                   key=lambda idx: tuple(idx[i] for i in sv_pos) + tuple(idx[i] for i in other_pos))
+    positions = sv_pos + other_pos
+    inverse = [positions.index(i) for i in range(len(keys))]
+    order = (tuple(ordered[i] for i in inverse)
+             for ordered in itertools.product(*[range(shape[i]) for i in positions]))
+    x_pos = [i for i, k in enumerate(keys) if _is_global_x(k)]
+    local_pos = [i for i, k in enumerate(keys) if getattr(k, 'phase_name', None) is not None]
+    state_pos = [keys.index(sv) if sv in conds else None for sv in state_variables]
     groups = []
     for idx in order:
-        point = OrderedDict((k, conds[k][i]) for k, i in zip(keys, idx))
-        x_sum = sum(float(val) for k, val in point.items() if isinstance(k, v.MoleFraction) and k.phase_name is None)
+        values = [conds[k][i] for k, i in zip(keys, idx)]
+        x_sum = sum(float(values[i]) for i in x_pos)
         if x_sum > 1:
             continue   # sum of independent mole fractions greater than one: left empty, as by the reference
-        sv_values = np.array([float(point.get(sv, 1.0)) for sv in state_variables])
-        local = tuple((k, float(val)) for k, val in point.items() if getattr(k, 'phase_name', None) is not None)
-        key = (tuple(sv_values), local)
+        local = tuple((keys[i], float(values[i])) for i in local_pos)
+        key = (tuple(float(values[i]) if i is not None else 1.0 for i in state_pos), local)
         if not groups or groups[-1][0] != key:
-            groups.append((key, sv_values, []))
-        groups[-1][2].append((idx, point))
+            groups.append((key, np.array(key[0]), []))
+        groups[-1][2].append((idx, OrderedDict(zip(keys, values))))
 
     def write(idx, out):
         status, phs, Ys, Xs, ns, Gs, mu, rounds = out
@@ -773,13 +815,10 @@ def _solve_workspace(wks, threads):
         other workers from it)."""
         rng = np.random.default_rng(0)
         seeds = worker.prepare(phases, items[0][1], sv_values, params, elements, snapshot, rng, carry, t_index)
-        rows = [_condition_rows(point, elements, molar_masses) for _, point in items]
-        plain = all(not r[3].any() and _trace_target(r[0], r[1], r[3]) is None for r in rows)
-        if plain and len(items) > 1:
+        rows = _sequence_conditions(items, elements, molar_masses) if len(items) > 1 else None
+        if rows is not None:
             # ordinary conditions: the whole sequence in C without the GIL; failures are retried below
-            args = (np.array([r[0] for r in rows]), np.array([r[1] for r in rows]), np.array([r[2] for r in rows]),
-                    np.array([r[3] for r in rows]), seeds)
-            st, na, phs, amt, Xs, Ys, Gs, mus = worker.solver.solve_sequence(*args)
+            st, na, phs, amt, Xs, Ys, Gs, mus = worker.solver.solve_sequence(*rows, seeds)
             for t, (idx, point) in enumerate(items):
                 if st[t] == 0:
                     k = na[t]
