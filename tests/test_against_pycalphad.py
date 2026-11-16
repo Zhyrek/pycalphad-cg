@@ -81,9 +81,17 @@ def test_input_errors_match_pycalphad():
     # missing state variable
     with pytest.raises(ConditionError):
         CGWorkspace(dbf, ['AL', 'FE', 'VA'], phases, {v.X('AL'): 0.3, v.P: 101325, v.N: 1}).eq
-    # N != 1
-    with pytest.raises(ConditionError):
-        CGWorkspace(dbf, ['AL', 'FE', 'VA'], phases, {v.T: 1000, v.X('AL'): 0.3, v.P: 101325, v.N: 2}).eq
+    # N != 1: an error where pycalphad rejects it (up to 0.12), else the same equilibrium for N moles
+    conds = {v.T: 1000, v.X('AL'): 0.3, v.P: 101325, v.N: 2}
+    try:
+        ref = Workspace(dbf, ['AL', 'FE', 'VA'], phases, conds).eq
+    except ConditionError:
+        with pytest.raises(ConditionError):
+            CGWorkspace(dbf, ['AL', 'FE', 'VA'], phases, conds).eq
+    else:
+        eq = CGWorkspace(dbf, ['AL', 'FE', 'VA'], phases, conds).eq
+        assert np.nansum(eq.NP) == pytest.approx(2)
+        assert np.squeeze(eq.GM) == pytest.approx(np.squeeze(ref.GM), abs=0.01)
     # wrong number of composition conditions
     with pytest.raises(ValueError, match='degrees of freedom'):
         CGWorkspace(dbf, ['AL', 'FE', 'VA'], phases, {v.T: 1000, v.P: 101325, v.N: 1}).eq

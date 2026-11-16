@@ -185,6 +185,9 @@ takes the same time on both.
   - a phase without a temperature state variable, or with non-linear internal constraints;
   - conditions other than T, P, N, mole and mass fractions, chemical potentials and linear combinations of mole
     fractions;
+  - components that are not elements, conditions on the amount of single components (`v.Moles(i)`), and
+    conditions without N where pycalphad has `v.Moles` (component bases and amount conditions in pycalphad's
+    development branches);
   - phase-local conditions other than site fractions and mole fractions, or a phase-local mole fraction in a phase
     whose formula moles depend on its site fractions (ionic liquids).
 - **`fallback=False` in mapping:** pycalphad's mapping catches every error from its solver and goes on, so the

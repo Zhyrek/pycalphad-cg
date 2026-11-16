@@ -9,7 +9,7 @@ derivatives, reference states) is pycalphad's, unchanged.
 import functools
 import warnings
 
-import numpy as np
+from pycalphad import variables as v
 from pycalphad.codegen.phase_record_factory import PhaseRecordFactory
 from pycalphad.core.equilibrium import equilibrium as _pycalphad_equilibrium
 from pycalphad.core.solver import Solver
@@ -42,10 +42,11 @@ class Workspace(_PycalphadWorkspace):
         super().__init__(*args, **kwargs)
 
     def recompute(self):
-        self._validate_inputs()
-        _check_degrees_of_freedom(self.conditions, self.phase_record_factory)
         fallback = options.fallback if self.cg_fallback is None else self.cg_fallback
         try:
+            self._check_basis()
+            self._validate_inputs()
+            _check_degrees_of_freedom(self.conditions, self.phase_record_factory)
             self._check_supported()
             threads = options.threads if self.cg_threads is None else self.cg_threads
             with SOLVE_LOCK:   # (the phase-record factory, with its parameters, can be shared between workspaces)
@@ -71,14 +72,34 @@ class Workspace(_PycalphadWorkspace):
         if len(filter_phases(self.database, comps, self.phases)) == 0:
             raise ConditionError(f'None of the passed phases ({self.phases}) are active. List of possible phases: '
                                  f'{possible}.')
+        # (N != 1 is pycalphad's to accept or reject when the condition is set: pycalphad up to 0.12 rejects it, and
+        # column generation's mass balance takes any N)
         conds = {str(key): as_quantity(key, value).to(key.implementation_units).magnitude
                  for key, value in self.conditions.items()}
-        if 'N' in conds and np.any(np.asarray(conds['N']) != 1):
-            raise ConditionError(f'N!=1 is not yet supported, got N={conds["N"]}')
         missing = sorted({str(sv) for sv in self.phase_record_factory.state_variables} - set(conds) - {'N'})
         if missing:
             raise ConditionError(f'The following state variable(s) are required by the Model(s) for the active '
                                  f'phases but were not specified: {missing}.')
+
+    def _check_basis(self):
+        """Column generation's conditions are on the amounts of the elements in total (N) and their fractions.
+        Components that are not elements and conditions on amounts of single components (pycalphad versions with
+        ``v.Moles``, where N is no longer implied) go to pycalphad's solver."""
+        elements = {str(el).upper() for el in self.database.elements} | {'VA'}
+        others = sorted(str(c) for c in self.components if str(c).upper() not in elements)
+        if others:
+            raise CGCapabilityError(f'components that are not elements: {others}')
+        others = sorted(str(key) for key in self.conditions.keys()
+                        if isinstance(key, (v.MoleFraction, v.MassFraction, v.ChemicalPotential))
+                        and key.species.name.upper() not in elements)
+        if others:
+            raise CGCapabilityError(f'conditions on components that are not elements: {others}')
+        moles = getattr(v, 'Moles', None)
+        if moles is not None:
+            if any(isinstance(key, moles) and key != v.N for key in self.conditions):
+                raise CGCapabilityError('conditions on the amount of a component')
+            if v.N not in self.conditions.keys():
+                raise CGCapabilityError('conditions without N')
 
     def _check_supported(self):
         if self.calc_opts and set(self.calc_opts) - {'pdens'}:
